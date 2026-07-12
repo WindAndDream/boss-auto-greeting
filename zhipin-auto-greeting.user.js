@@ -6117,6 +6117,13 @@
         justify-content: space-between;
         gap: 10px;
       }
+      #zhipin-auto-greeting-root .za-header {
+        position: sticky;
+        top: 0;
+        z-index: 3;
+        background: var(--za-bg);
+        box-shadow: 0 1px 0 rgba(215, 221, 231, 0.85);
+      }
       #zhipin-auto-greeting-root .za-footer {
         border-top: 1px solid var(--za-border);
         border-bottom: 0;
@@ -6127,8 +6134,12 @@
         font-size: 12px;
       }
       #zhipin-auto-greeting-root .za-icon-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         width: 28px;
         height: 28px;
+        padding: 0;
         border: 1px solid var(--za-border);
         border-radius: 6px;
         background: #fff;
@@ -6138,23 +6149,31 @@
       }
       #zhipin-auto-greeting-root .za-status {
         flex: 0 0 auto;
+        position: sticky;
+        top: 73px;
+        z-index: 2;
         margin: 12px 14px 0;
-        padding: 8px 10px;
+        padding: 9px 10px;
+        border: 1px solid #d7dde7;
         border-radius: 6px;
-        background: #f2f4f7;
+        background: #eef2f6;
+        box-shadow: 0 0 0 14px var(--za-bg), 0 10px 18px rgba(15, 23, 42, 0.08);
         color: #344054;
         word-break: break-word;
       }
       #zhipin-auto-greeting-root .za-status[data-type="ok"] {
         background: #ecfdf3;
+        border-color: #abefc6;
         color: #027a48;
       }
       #zhipin-auto-greeting-root .za-status[data-type="warn"] {
         background: #fffaeb;
+        border-color: #fedf89;
         color: #b54708;
       }
       #zhipin-auto-greeting-root .za-status[data-type="error"] {
         background: #fef3f2;
+        border-color: #fecdca;
         color: #b42318;
       }
       #zhipin-auto-greeting-root .za-section {
@@ -6187,6 +6206,14 @@
       #zhipin-auto-greeting-root textarea {
         resize: vertical;
         min-height: 76px;
+      }
+      #zhipin-auto-greeting-root select[data-field="companyFilterMode"]:focus,
+      #zhipin-auto-greeting-root select[data-field="companyFilterMode"]:focus-visible,
+      #zhipin-auto-greeting-root select[data-field="exportType"]:focus,
+      #zhipin-auto-greeting-root select[data-field="exportType"]:focus-visible {
+        outline: none;
+        box-shadow: none;
+        border-color: var(--za-border);
       }
       #zhipin-auto-greeting-root button {
         min-height: 32px;
