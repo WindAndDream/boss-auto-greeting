@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
-// @version      0.1.3
+// @version      0.1.4
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
@@ -37,12 +37,14 @@
   // 全局常量：集中维护脚本版本、存储 key、BOSS 接口特征和默认问候语。
   const APP = {
     name: 'BOSS自动沟通',
-    version: '0.1.3',
+    version: '0.1.4',
     dbName: 'ZhipinAutoGreetingDB',
     dbVersion: 1,
     configKey: '__zhipin_auto_greeting_config__',
     runKey: '__zhipin_auto_greeting_run_state__',
+    debugEnabledKey: '__zhipin_auto_greeting_debug_enabled__',
     debugEventsKey: '__zhipin_auto_greeting_debug_events__',
+    maxDebugEvents: 300,
     jobListApiPattern: /\/wapi\/zpgeek\/(?:search\/joblist|pc\/(?:recommend|search)\/job\/list)\.json/i,
     jobDetailApiPattern: /\/wapi\/zpgeek\/job\/detail\.json/i,
     fastReplyUrl: '/wapi/zpchat/fastReply/userFastReplyList/get',
@@ -148,6 +150,8 @@
   let config = loadConfig();
 
   cleanupLegacyDebugState();
+  runtime.debugEvents = isDebugEnabled() ? loadStoredDebugEvents() : [];
+  installDebugHelpers();
   rememberRouteUrl(location.href);
   // document-start 先拦截岗位相关接口，避免页面很早请求岗位列表时脚本拿不到接口数据。
   installNetworkInterceptors();
@@ -355,6 +359,71 @@
     localStorage.removeItem('__zhipin_auto_greeting_debug__');
   }
 
+  // 调试事件需要跨 SPA 跳转和聊天页跳转保留，否则第一条新日志会覆盖上一页的诊断上下文。
+  function loadStoredDebugEvents() {
+    try {
+      const events = JSON.parse(localStorage.getItem(APP.debugEventsKey) || '[]');
+      return Array.isArray(events) ? events.slice(-APP.maxDebugEvents) : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  // 默认关闭结构化诊断日志；排查偶发问题时可通过 helper 或 localStorage 开启。
+  function isDebugEnabled() {
+    try {
+      return localStorage.getItem(APP.debugEnabledKey) === '1' ||
+        pageWindow.__ZHIPIN_AUTO_GREETING_DEBUG__ === true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // 暴露调试工具，排查时可在 DevTools 控制台开启、导出或清理结构化日志。
+  function installDebugHelpers() {
+    try {
+      pageWindow.__zhipinAutoGreetingDebug = {
+        version: APP.version,
+        enabledKey: APP.debugEnabledKey,
+        key: APP.debugEventsKey,
+        enabled() {
+          return isDebugEnabled();
+        },
+        enable() {
+          localStorage.setItem(APP.debugEnabledKey, '1');
+          runtime.debugEvents = loadStoredDebugEvents();
+          if (runtime.ui) UI.renderDebugLogControls();
+          return true;
+        },
+        disable() {
+          localStorage.removeItem(APP.debugEnabledKey);
+          if (runtime.ui) UI.renderDebugLogControls();
+          return true;
+        },
+        dump() {
+          return loadStoredDebugEvents();
+        },
+        text() {
+          return JSON.stringify(loadStoredDebugEvents(), null, 2);
+        },
+        clear() {
+          runtime.debugEvents = [];
+          localStorage.removeItem(APP.debugEventsKey);
+          if (runtime.ui) UI.renderDebugLogControls();
+          return true;
+        },
+        copy() {
+          const text = JSON.stringify(loadStoredDebugEvents(), null, 2);
+          if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            return navigator.clipboard.writeText(text).then(() => text.length);
+          }
+          console.log(text);
+          return text.length;
+        },
+      };
+    } catch (_) {}
+  }
+
   // 跨页面自动化状态：记录当前阶段、岗位游标、待发送岗位、返回列表地址和下一次运行时间。
   const RunState = {
     // 从 localStorage 读取运行状态，异常 JSON 直接视为空状态。
@@ -406,9 +475,11 @@
     },
   };
 
-  // 统一写调试事件：既放在内存里，也写 localStorage，方便页面跳转后继续排查。
+  // 统一写调试事件；默认关闭，开启后才写内存/localStorage/控制台。
   function logDebugEvent(type, data, level) {
     try {
+      if (!isDebugEnabled()) return;
+
       const event = {
         time: nowIso(),
         type,
@@ -417,8 +488,9 @@
       };
 
       runtime.debugEvents.push(event);
-      runtime.debugEvents = runtime.debugEvents.slice(-120);
+      runtime.debugEvents = runtime.debugEvents.slice(-APP.maxDebugEvents);
       localStorage.setItem(APP.debugEventsKey, JSON.stringify(runtime.debugEvents));
+      if (runtime.ui) UI.renderDebugLogControls();
 
       const method = level || (/error|timeout|unknown|missing|failed/i.test(type) ? 'warn' : 'info');
       const logger = console[method] || console.log;
@@ -492,6 +564,66 @@
     };
   }
 
+  // 说明等待详情阶段是否需要主动补拉接口，避免只有 true/false 看不出原因。
+  function getJobDetailFetchDecision(job, detail, options) {
+    const detailSalary = getReadableSalary(detail && detail.salary);
+    const jobSalary = getDisplaySalary(job);
+    const forceApiFetch = Boolean(options && options.forceApiFetch);
+
+    if (!detail) {
+      return {
+        shouldFetch: true,
+        reason: 'missing_detail',
+        forceApiFetch,
+        hasRawDetail: false,
+        detailSalary,
+        jobSalary,
+      };
+    }
+
+    if (!forceApiFetch) {
+      return {
+        shouldFetch: false,
+        reason: 'force_api_fetch_disabled',
+        forceApiFetch,
+        hasRawDetail: Boolean(detail.rawDetail),
+        detailSalary,
+        jobSalary,
+      };
+    }
+
+    if (!detail.rawDetail) {
+      return {
+        shouldFetch: true,
+        reason: 'missing_raw_detail',
+        forceApiFetch,
+        hasRawDetail: false,
+        detailSalary,
+        jobSalary,
+      };
+    }
+
+    if (!detailSalary && !jobSalary) {
+      return {
+        shouldFetch: true,
+        reason: 'missing_salary',
+        forceApiFetch,
+        hasRawDetail: true,
+        detailSalary,
+        jobSalary,
+      };
+    }
+
+    return {
+      shouldFetch: false,
+      reason: 'detail_sufficient',
+      forceApiFetch,
+      hasRawDetail: true,
+      detailSalary,
+      jobSalary,
+    };
+  }
+
   // DOM 卡片摘要：用于排查“接口岗位”和“页面卡片”是否匹配错位。
   function summarizeDomInfoForDebug(domInfo) {
     if (!domInfo) return null;
@@ -524,6 +656,7 @@
       firstPageSerial: runtime.jobListFirstPageSerial,
       latestJobListResponse: runtime.latestJobListResponse,
       latestFirstPageJobListResponse: runtime.latestFirstPageJobListResponse,
+      latestJobListRequest: summarizeJobListRequest(runtime.latestJobListRequest),
       visibleCardCount: getJobCards().length,
     };
   }
@@ -682,6 +815,28 @@
     return [];
   }
 
+  function summarizeJobListRequest(requestMeta) {
+    if (!requestMeta) return null;
+    return {
+      url: requestMeta.url,
+      method: requestMeta.method || 'GET',
+      hasBody: requestMeta.body !== undefined && requestMeta.body !== null,
+      bodyType: getBodyType(requestMeta.body),
+      replayable: isReplayableJobListRequest(requestMeta),
+      source: requestMeta.source,
+    };
+  }
+
+  function getBodyType(body) {
+    if (body === undefined || body === null) return '';
+    try {
+      const rawType = Object.prototype.toString.call(body).match(/\[object ([^\]]+)\]/);
+      return rawType && rawType[1] || typeof body;
+    } catch (_) {
+      return typeof body;
+    }
+  }
+
   function getLatestReplayableJobListRequest() {
     if (isReplayableJobListRequest(runtime.latestJobListRequest)) return runtime.latestJobListRequest;
 
@@ -778,9 +933,9 @@
   }
 
   // 网络拦截入口：根据 URL 分发到列表或详情解析流程。
-  function ingestTrackedJobResponse(url, text, source) {
+  function ingestTrackedJobResponse(url, text, source, requestMeta) {
     if (APP.jobListApiPattern.test(url)) {
-      ingestJobListResponse(url, text, source);
+      ingestJobListResponse(url, text, source, requestMeta);
       return;
     }
 
@@ -849,7 +1004,7 @@
   }
 
   // 处理岗位列表响应：解析岗位数组、重置/追加当前列表数据池、并尝试重绑 DOM 卡片。
-  function ingestJobListResponse(url, text, source) {
+  function ingestJobListResponse(url, text, source, requestMeta) {
     if (!text) return;
 
     try {
@@ -881,6 +1036,7 @@
         shouldReplaceScope,
         jobCount: jobs.length,
         firstJobs: jobs.slice(0, 5).map(summarizeRawJob),
+        request: summarizeJobListRequest(requestMeta),
         listState: getDebugListState(),
       });
 
@@ -926,10 +1082,26 @@
         source,
         sourceUrl: url,
       });
-      if (!detail) return;
+      if (!detail) {
+        logDebugEvent('job_detail_response_empty', {
+          source,
+          url,
+          code: payload && payload.code,
+          message: normalizeText(payload && payload.message),
+          payloadKeys: payload && typeof payload === 'object' ? Object.keys(payload).slice(0, 12) : [],
+        }, 'warn');
+        return;
+      }
 
       JobRepository.rememberJobDetail(detail);
       const matched = JobRepository.applyDetailToPool(detail);
+      logDebugEvent('job_detail_response_ingested', {
+        source,
+        url,
+        detail: summarizeJobForDebug(detail),
+        matched: summarizeJobForDebug(matched),
+        listState: getDebugListState(),
+      });
       if (matched && document.querySelector('li.job-card-box')) {
         JobRepository.syncCards();
       }
@@ -1264,9 +1436,7 @@
 
     // 判断是否需要主动补拉详情接口，避免复用缺薪资/缺 rawDetail 的半成品详情。
     shouldFetchJobDetail(job, detail, options) {
-      if (!detail) return true;
-      if (!(options && options.forceApiFetch)) return false;
-      return !detail.rawDetail || (!getReadableSalary(detail.salary) && !getDisplaySalary(job));
+      return getJobDetailFetchDecision(job, detail, options).shouldFetch;
     },
 
     // 点击岗位卡片后等待详情接口/HTML 数据到达；超时则主动补抓接口。
@@ -1276,6 +1446,13 @@
       const totalTimeout = Math.max(800, Number(timeout || 2200));
       const startedAt = Date.now();
       let detail = this.getDetailForJob(job);
+      logDebugEvent('job_detail_wait_start', {
+        job: summarizeJobForDebug(job),
+        cachedDetail: summarizeJobForDebug(detail),
+        timeout: totalTimeout,
+        resourceStartedAt,
+        options: detailOptions,
+      });
 
       if (!detail) {
         try {
@@ -1284,12 +1461,32 @@
             Math.min(1800, totalTimeout),
             '岗位详情接口',
           );
-        } catch (_) {}
+          logDebugEvent('job_detail_wait_initial_hit', {
+            job: summarizeJobForDebug(job),
+            detail: summarizeJobForDebug(detail),
+            elapsedMs: Date.now() - startedAt,
+          });
+        } catch (error) {
+          logDebugEvent('job_detail_wait_initial_timeout', {
+            job: summarizeJobForDebug(job),
+            message: error && error.message || String(error),
+            elapsedMs: Date.now() - startedAt,
+          }, 'warn');
+        }
       }
+
+      const fetchDecision = getJobDetailFetchDecision(job, detail, detailOptions);
+      logDebugEvent('job_detail_fetch_decision', {
+        job: summarizeJobForDebug(job),
+        detail: summarizeJobForDebug(detail),
+        decision: fetchDecision,
+        resourceStartedAt,
+        elapsedMs: Date.now() - startedAt,
+      }, fetchDecision.shouldFetch ? 'warn' : 'info');
 
       // BOSS 页面会缓存原始 XHR 方法，导致后续切换岗位时响应偶尔绕过拦截器。
       // 此时用岗位列表中的 securityId/lid（或刚发生的详情资源 URL）主动补取一次。
-      if (this.shouldFetchJobDetail(job, detail, detailOptions)) {
+      if (fetchDecision.shouldFetch) {
         detail = await this.fetchJobDetail(job, resourceStartedAt).catch((error) => {
           logDebugEvent('job_detail_active_fetch_failed', {
             job: summarizeJobForDebug(job),
@@ -1308,13 +1505,36 @@
             Math.min(1500, Math.max(300, totalTimeout - (Date.now() - startedAt))),
             '岗位详情接口',
           );
-        } catch (_) {}
+          logDebugEvent('job_detail_wait_late_hit', {
+            job: summarizeJobForDebug(job),
+            detail: summarizeJobForDebug(detail),
+            elapsedMs: Date.now() - startedAt,
+          });
+        } catch (error) {
+          logDebugEvent('job_detail_wait_late_timeout', {
+            job: summarizeJobForDebug(job),
+            message: error && error.message || String(error),
+            elapsedMs: Date.now() - startedAt,
+          }, 'warn');
+        }
       }
 
-      if (!includeHtml || !detail || detail.htmlCapturedAt) return detail;
+      if (!includeHtml || !detail || detail.htmlCapturedAt) {
+        logDebugEvent(detail ? 'job_detail_wait_finish' : 'job_detail_wait_missing', {
+          job: summarizeJobForDebug(job),
+          detail: summarizeJobForDebug(detail),
+          includeHtml,
+          elapsedMs: Date.now() - startedAt,
+        }, detail ? 'info' : 'warn');
+        return detail;
+      }
 
       if (!detail.htmlFetchPending) {
         this.enrichDetailWithHtml(detail).catch((error) => {
+          logDebugEvent('job_detail_html_enrich_failed', {
+            detail: summarizeJobForDebug(detail),
+            message: error && error.message || String(error),
+          }, 'warn');
           console.warn('[ZhipinAuto] 岗位 HTML 详情解析失败', error);
         });
       }
@@ -1323,38 +1543,94 @@
       if (remaining <= 100) return detail;
 
       try {
-        return await waitFor(() => {
+        const htmlDetail = await waitFor(() => {
           const latest = this.getDetailForJob(job);
           return latest && latest.htmlCapturedAt ? latest : null;
         }, Math.min(remaining, 1800), '岗位 HTML 详情');
-      } catch (_) {
-        return this.getDetailForJob(job) || detail;
+        logDebugEvent('job_detail_html_wait_hit', {
+          job: summarizeJobForDebug(job),
+          detail: summarizeJobForDebug(htmlDetail),
+          elapsedMs: Date.now() - startedAt,
+        });
+        return htmlDetail;
+      } catch (error) {
+        const fallbackDetail = this.getDetailForJob(job) || detail;
+        logDebugEvent('job_detail_html_wait_timeout', {
+          job: summarizeJobForDebug(job),
+          detail: summarizeJobForDebug(fallbackDetail),
+          message: error && error.message || String(error),
+          elapsedMs: Date.now() - startedAt,
+        }, 'warn');
+        return fallbackDetail;
       }
     },
 
     // 主动请求岗位详情接口，用于 XHR 被页面缓存绕过或拦截器没拿到响应时的兜底。
     async fetchJobDetail(job, resourceStartedAt) {
       const fetcher = nativePageFetch || (typeof pageWindow.fetch === 'function' && pageWindow.fetch.bind(pageWindow));
-      if (!fetcher) return null;
+      if (!fetcher) {
+        logDebugEvent('job_detail_active_fetch_unavailable', {
+          reason: 'missing_fetcher',
+          job: summarizeJobForDebug(job),
+        }, 'warn');
+        return null;
+      }
       const directUrl = buildJobDetailApiUrl(job);
       const latestUrl = findLatestJobDetailApiUrl(resourceStartedAt);
       const requestTargets = [];
       if (directUrl) requestTargets.push({ url: directUrl, direct: true });
       if (latestUrl && latestUrl !== directUrl) requestTargets.push({ url: latestUrl, direct: false });
-      if (!requestTargets.length) return null;
+      if (!requestTargets.length) {
+        logDebugEvent('job_detail_active_fetch_unavailable', {
+          reason: 'missing_request_targets',
+          job: summarizeJobForDebug(job),
+          requestIdentity: getJobDetailRequestIdentity(job),
+          directUrl,
+          latestUrl,
+          resourceStartedAt,
+        }, 'warn');
+        return null;
+      }
 
       const expectedJobId = normalizeText(job && job.encryptJobId);
       let lastError = null;
+      logDebugEvent('job_detail_active_fetch_targets', {
+        job: summarizeJobForDebug(job),
+        requestIdentity: getJobDetailRequestIdentity(job),
+        directUrl,
+        latestUrl,
+        resourceStartedAt,
+        targets: requestTargets,
+      });
 
       for (const target of requestTargets) {
         try {
+          logDebugEvent('job_detail_active_fetch_request', {
+            job: summarizeJobForDebug(job),
+            target,
+            expectedJobId,
+          });
           const response = await fetcher(target.url, {
             credentials: 'include',
             headers: { Accept: 'application/json, text/plain, */*' },
           });
+          logDebugEvent('job_detail_active_fetch_response', {
+            target,
+            status: response.status,
+            ok: response.ok,
+            redirected: response.redirected,
+            responseUrl: response.url,
+          }, response.ok ? 'info' : 'warn');
           if (!response.ok) throw new Error(`岗位详情请求失败：HTTP ${response.status}`);
 
           const payload = await response.json();
+          logDebugEvent('job_detail_active_fetch_payload', {
+            target,
+            code: payload && payload.code,
+            message: normalizeText(payload && payload.message),
+            payloadKeys: payload && typeof payload === 'object' ? Object.keys(payload).slice(0, 12) : [],
+            hasData: Boolean(payload && (payload.zpData || payload.data)),
+          }, Number(payload && payload.code) === 0 ? 'info' : 'warn');
           if (Number(payload && payload.code) !== 0) {
             throw new Error(`岗位详情请求失败：${normalizeText(payload && payload.message) || '未知错误'}`);
           }
@@ -1365,17 +1641,40 @@
           });
           if (!detail) throw new Error('岗位详情响应为空');
           if (expectedJobId && detail.encryptJobId && detail.encryptJobId !== expectedJobId) {
+            logDebugEvent('job_detail_active_fetch_expected_id_mismatch', {
+              target,
+              expectedJobId,
+              detail: summarizeJobForDebug(detail),
+            }, 'warn');
             throw new Error(`岗位详情不匹配：期望 ${expectedJobId}，实际 ${detail.encryptJobId}`);
           }
-          if (!isFetchedDetailCompatibleWithJob(job, detail, { allowWeakWithReliableKey: target.direct })) {
-            throw new Error('岗位详情不匹配：响应内容不像当前岗位');
+          const compatibility = getFetchedDetailCompatibilityReport(job, detail, { allowWeakWithReliableKey: target.direct });
+          if (!compatibility.compatible) {
+            logDebugEvent('job_detail_active_fetch_incompatible', {
+              target,
+              job: summarizeJobForDebug(job),
+              detail: summarizeJobForDebug(detail),
+              compatibility,
+            }, 'warn');
+            throw new Error(`岗位详情不匹配：${compatibility.reason || '响应内容不像当前岗位'}`);
           }
 
           this.rememberJobDetail(detail);
-          this.applyDetailToPool(detail);
+          const matched = this.applyDetailToPool(detail);
+          logDebugEvent('job_detail_active_fetch_success', {
+            target,
+            detail: summarizeJobForDebug(detail),
+            matched: summarizeJobForDebug(matched),
+            compatibility,
+          });
           return detail;
         } catch (error) {
           lastError = error;
+          logDebugEvent('job_detail_active_fetch_target_failed', {
+            target,
+            job: summarizeJobForDebug(job),
+            message: error && error.message || String(error),
+          }, 'warn');
         }
       }
 
@@ -1616,7 +1915,18 @@
     async fetchLatestJobList() {
       const fetcher = nativePageFetch || (typeof pageWindow.fetch === 'function' && pageWindow.fetch.bind(pageWindow));
       const request = getLatestReplayableJobListRequest();
-      if (!request || !fetcher) return false;
+      if (!request || !fetcher) {
+        logDebugEvent('job_list_active_fetch_skipped', {
+          reason: !fetcher ? 'missing_fetcher' : 'missing_replayable_request',
+          latestUrl: findLatestJobListApiUrl(),
+          latestRequest: summarizeJobListRequest(runtime.latestJobListRequest),
+        }, 'warn');
+        return false;
+      }
+
+      logDebugEvent('job_list_active_fetch_request', {
+        request: summarizeJobListRequest(request),
+      });
       const response = await fetcher(request.url, buildJobListFetchInit(request));
       if (!response.ok) throw new Error(`岗位列表请求失败：HTTP ${response.status}`);
 
@@ -1625,7 +1935,7 @@
         throw new Error(`岗位列表请求失败：${normalizeText(payload && payload.message) || '未知错误'}`);
       }
 
-      ingestJobListResponse(request.url, JSON.stringify(payload), 'active-fetch');
+      ingestJobListResponse(request.url, JSON.stringify(payload), 'active-fetch', request);
       return runtime.jobPool.length > 0;
     },
 
@@ -2194,6 +2504,16 @@
             <p class="za-hint">按时间删除会使用发送时间，未发送记录使用点击或更新时间。</p>
           </section>
 
+          <section class="za-section">
+            <h3>调试日志</h3>
+            <label class="za-check"><input data-role="debugLogEnabled" type="checkbox"> 记录诊断日志</label>
+            <div class="za-inline">
+              <button type="button" data-action="exportDebugLogs">导出日志</button>
+              <button type="button" class="za-danger-soft" data-action="clearDebugLogs">清除日志</button>
+            </div>
+            <p class="za-hint" data-role="debugLogStatus">日志 0 条</p>
+          </section>
+
           <section class="za-section za-list-section">
             <h3>已沟通列表</h3>
             <div class="za-list-viewport" data-role="listViewport">
@@ -2230,6 +2550,8 @@
         bossActiveOptionMenu: root.querySelector('[data-role="bossActiveOptionMenu"]'),
         bossActiveCustomInput: root.querySelector('[data-role="bossActiveCustomInput"]'),
         bossActiveCustomList: root.querySelector('[data-role="bossActiveCustomList"]'),
+        debugLogEnabled: root.querySelector('[data-role="debugLogEnabled"]'),
+        debugLogStatus: root.querySelector('[data-role="debugLogStatus"]'),
         listViewport: root.querySelector('[data-role="listViewport"]'),
         listSpacer: root.querySelector('[data-role="listSpacer"]'),
         listItems: root.querySelector('[data-role="listItems"]'),
@@ -2240,6 +2562,7 @@
       this.prepareConfigFields();
       this.bindEvents();
       this.applyConfigToForm();
+      this.renderDebugLogControls();
       this.renderFastReplyOptions();
       this.renderBossActiveFilterOptions();
       this.setPanelOpen(config.panelOpen);
@@ -2328,8 +2651,10 @@
         if (action === 'start') Automation.start();
         if (action === 'stop') Automation.stop('已停止', { manual: true });
         if (action === 'export') Exporter.exportRecords();
+        if (action === 'exportDebugLogs') DebugLogService.exportLogs();
         if (action === 'clearRecordsByTime') RecordCleaner.clearByTime();
         if (action === 'clearAllRecords') RecordCleaner.clearAll();
+        if (action === 'clearDebugLogs') DebugLogService.clearLogs();
         if (action === 'addBossActiveOption') this.addBossActiveCustomOption();
         if (action === 'deleteBossActiveOption') this.deleteBossActiveCustomOption(target.dataset.value);
         if (action === 'removeBossActiveSelection') this.removeBossActiveSelection(target.dataset.value);
@@ -2348,6 +2673,10 @@
         this.saveFormToConfig({ event });
       });
       root.addEventListener('change', (event) => {
+        if (event.target && event.target.dataset && event.target.dataset.role === 'debugLogEnabled') {
+          DebugLogService.setEnabled(event.target.checked);
+          return;
+        }
         if (this.shouldIgnoreConfigFieldEvent(event)) return;
         this.noteCompanyFilterEdit(event);
         if (event.target && event.target.dataset && event.target.dataset.role === 'bossActiveOption') {
@@ -2490,7 +2819,20 @@
       }
 
       this.applyModeVisibility();
+      this.renderDebugLogControls();
       this.renderBossActiveFilterOptions();
+    },
+
+    // 调试日志不属于运行配置，单独同步本地开关和日志条数。
+    renderDebugLogControls() {
+      if (!runtime.ui) return;
+      if (runtime.ui.debugLogEnabled) {
+        runtime.ui.debugLogEnabled.checked = isDebugEnabled();
+      }
+      if (runtime.ui.debugLogStatus) {
+        const count = loadStoredDebugEvents().length;
+        runtime.ui.debugLogStatus.textContent = `日志 ${count} 条`;
+      }
     },
 
     // 从表单读取配置并保存；运行中会跳过被锁定的字段。
@@ -3913,6 +4255,84 @@
         saveHandlePromise,
       );
       UI.setStatus(`Excel 导出完成：${rows.length} 条记录，文件 ${fileName}`, 'ok');
+    },
+  };
+
+  // 调试日志用于排查偶发页面/接口问题，默认写入 localStorage 的短期环形缓冲。
+  const DebugLogService = {
+    setEnabled(enabled) {
+      const shouldEnable = Boolean(enabled);
+      try {
+        if (shouldEnable) {
+          localStorage.setItem(APP.debugEnabledKey, '1');
+          runtime.debugEvents = loadStoredDebugEvents();
+          logDebugEvent('debug_logging_enabled', { source: 'ui' });
+          UI.setStatus('已开启诊断日志', 'ok');
+        } else {
+          localStorage.removeItem(APP.debugEnabledKey);
+          UI.setStatus('已关闭诊断日志', 'info');
+        }
+      } catch (error) {
+        UI.setStatus(`切换诊断日志失败：${error.message || error}`, 'warn');
+      }
+      UI.renderDebugLogControls();
+    },
+
+    async exportLogs() {
+      const events = loadStoredDebugEvents();
+      if (!events.length) {
+        UI.setStatus('暂无诊断日志可导出', 'warn');
+        UI.renderDebugLogControls();
+        return;
+      }
+
+      const outputFileName = ensureFileExtension(`zhipin-debug-logs-${dateFileName()}`, 'json');
+      const saveHandlePromise = requestSaveFileHandle(outputFileName, 'json');
+      const payload = {
+        app: APP.name,
+        version: APP.version,
+        exportedAt: nowIso(),
+        href: location.href,
+        debugEnabled: isDebugEnabled(),
+        eventCount: events.length,
+        events,
+      };
+
+      try {
+        const fileName = await downloadBlob(
+          `\uFEFF${JSON.stringify(payload, null, 2)}`,
+          outputFileName,
+          'application/json;charset=utf-8',
+          'json',
+          saveHandlePromise,
+        );
+        UI.setStatus(`诊断日志导出完成：${events.length} 条，文件 ${fileName}`, 'ok');
+      } catch (error) {
+        if (error && error.zhipinAutoExportCancelled) {
+          UI.setStatus('已取消导出诊断日志', 'info');
+          return;
+        }
+        UI.setStatus(`导出诊断日志失败：${error.message || error}`, 'warn');
+      }
+    },
+
+    async clearLogs() {
+      try {
+        const count = loadStoredDebugEvents().length;
+        if (!count) {
+          UI.setStatus('暂无诊断日志可清除', 'info');
+          UI.renderDebugLogControls();
+          return;
+        }
+        if (!(await askConfirm(`确定清除 ${count} 条诊断日志吗？`))) return;
+
+        runtime.debugEvents = [];
+        localStorage.removeItem(APP.debugEventsKey);
+        UI.renderDebugLogControls();
+        UI.setStatus(`已清除 ${count} 条诊断日志`, 'ok');
+      } catch (error) {
+        UI.setStatus(`清除诊断日志失败：${error.message || error}`, 'warn');
+      }
     },
   };
 
@@ -6128,28 +6548,92 @@
 
   // 弱签名只能用于没有可靠 ID 的兜底匹配，并且文本字段不能明显冲突。
   function isWeakDetailCompatible(job, detail) {
-    if (!job || !detail) return false;
+    return getWeakDetailCompatibilityReport(job, detail).compatible;
+  }
 
-    if (!areComparableTextsCompatible(job.jobName, detail.jobName)) return false;
-    if (!areComparableTextsCompatible(job.company, detail.company)) return false;
+  function getWeakDetailCompatibilityReport(job, detail) {
+    if (!job || !detail) {
+      return { compatible: false, reason: 'missing_job_or_detail' };
+    }
+
+    if (!areComparableTextsCompatible(job.jobName, detail.jobName)) {
+      return {
+        compatible: false,
+        reason: 'job_name_mismatch',
+        jobName: job.jobName,
+        detailJobName: detail.jobName,
+      };
+    }
+    if (!areComparableTextsCompatible(job.company, detail.company)) {
+      return {
+        compatible: false,
+        reason: 'company_mismatch',
+        company: job.company,
+        detailCompany: detail.company,
+      };
+    }
 
     const jobSalary = getReadableSalary(job.salary);
     const detailSalary = getReadableSalary(detail.salary);
-    if (jobSalary && detailSalary && jobSalary !== detailSalary) return false;
+    if (jobSalary && detailSalary && jobSalary !== detailSalary) {
+      return {
+        compatible: false,
+        reason: 'salary_mismatch',
+        jobSalary,
+        detailSalary,
+      };
+    }
 
-    return true;
+    return {
+      compatible: true,
+      reason: 'weak_text_match',
+      jobSalary,
+      detailSalary,
+    };
   }
 
   // 主动补拉详情后的安全校验：优先要求可靠 ID 命中，必要时才退回文本兼容判断。
   function isFetchedDetailCompatibleWithJob(job, detail, options) {
+    return getFetchedDetailCompatibilityReport(job, detail, options).compatible;
+  }
+
+  function getFetchedDetailCompatibilityReport(job, detail, options) {
     const jobKeys = getReliableJobIdentityKeys(job);
-    const detailKeys = new Set(getReliableJobIdentityKeys(detail));
-    if (jobKeys.length && detailKeys.size) {
-      if (jobKeys.some((key) => detailKeys.has(key))) return true;
-      if (!(options && options.allowWeakWithReliableKey)) return false;
+    const detailKeyList = getReliableJobIdentityKeys(detail);
+    const detailKeys = new Set(detailKeyList);
+    const commonKeys = jobKeys.filter((key) => detailKeys.has(key));
+    const allowWeakWithReliableKey = Boolean(options && options.allowWeakWithReliableKey);
+    const weakReport = getWeakDetailCompatibilityReport(job, detail);
+
+    if (jobKeys.length && detailKeyList.length) {
+      if (commonKeys.length) {
+        return Object.assign({}, weakReport, {
+          compatible: true,
+          reason: 'reliable_key_match',
+          jobKeys,
+          detailKeys: detailKeyList,
+          commonKeys,
+          allowWeakWithReliableKey,
+        });
+      }
+      if (!allowWeakWithReliableKey) {
+        return Object.assign({}, weakReport, {
+          compatible: false,
+          reason: 'reliable_key_mismatch',
+          jobKeys,
+          detailKeys: detailKeyList,
+          commonKeys,
+          allowWeakWithReliableKey,
+        });
+      }
     }
 
-    return isWeakDetailCompatible(job, detail);
+    return Object.assign({}, weakReport, {
+      jobKeys,
+      detailKeys: detailKeyList,
+      commonKeys,
+      allowWeakWithReliableKey,
+    });
   }
 
   // 比较岗位名/公司名等文本字段；一边缺失时不阻断补全。
