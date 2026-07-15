@@ -36,8 +36,10 @@ async function notify(event) {
   const a = config.astrbot || {}; const umo = store.binding.umo || a.umo;
   if (!a.apiKey || !umo) return { sent: false, reason: 'AstrBot API Key 或 QQ 绑定目标未配置，事件已本地保存。' };
   const content = ['【BOSS 求职助手】', `类型：${event.type}`, event.jobTitle && `岗位：${event.jobTitle}`, event.company && `公司：${event.company}`, event.status && `结果：${event.status}`, event.reason && `原因：${event.reason}`].filter(Boolean).join('\n');
-  const response = await fetch(`${String(a.baseUrl).replace(/\/$/, '')}/im/message`, { method: 'POST', headers: { 'content-type':'application/json', authorization:`Bearer ${a.apiKey}` }, body: JSON.stringify({ umo, message:content }) });
-  return { sent: response.ok, status: response.status };
+  const response = await fetch(`${String(a.baseUrl).replace(/\/$/, '')}/im/message`, { method: 'POST', headers: { 'content-type':'application/json', authorization:`Bearer ${a.apiKey}` }, body: JSON.stringify({ umo, message:content }), signal: AbortSignal.timeout(10_000) });
+  const payload = await response.json().catch(() => ({}));
+  const sent = response.ok && payload.status === 'ok';
+  return { sent, status: response.status, reason: sent ? '' : String(payload.message || 'AstrBot 未接受消息') };
 }
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') return reply(res, 204, {});
