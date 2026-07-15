@@ -1,0 +1,14 @@
+{
+  "bridge_url": {
+    "description": "本机桥接服务地址",
+    "type": "string",
+    "default": "http://127.0.0.1:17861"
+  },
+  "bridge_token": {
+    "description": "桥接令牌",
+    "type": "string",
+    "hint": "与项目 config/config.json 中的 bridge.token 一致",
+    "obvious_hint": true,
+    "default": ""
+  }
+}

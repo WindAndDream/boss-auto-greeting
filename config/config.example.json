@@ -1,0 +1,9 @@
+{
+  "bridge": { "host": "127.0.0.1", "port": 17861, "token": "请替换为一段随机字符串" },
+  "astrbot": {
+    "baseUrl": "http://127.0.0.1:6185/api/v1",
+    "apiKey": "",
+    "umo": ""
+  },
+  "automation": { "dailyLimit": 20, "enabled": true }
+}

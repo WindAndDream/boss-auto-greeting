@@ -1,0 +1,12 @@
+{
+  "name": "boss-astrbot-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "description": "本机运行的 BOSS 直聘首轮问候与 AstrBot QQ 通知桥接工具",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "start": "node bridge/server.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "engines": { "node": ">=20" }
+}

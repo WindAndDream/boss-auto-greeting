@@ -1,0 +1,8 @@
+node_modules/
+bridge/data/*.json
+config/config.json
+config/.env
+dist/*.zip
+*.log
+__pycache__/
+*.pyc

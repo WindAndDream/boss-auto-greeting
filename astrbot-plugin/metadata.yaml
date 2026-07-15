@@ -1,0 +1,8 @@
+name: astrbot_plugin_boss_job_assistant
+display_name: BOSS 求职助手
+desc: 将 BOSS 首轮问候结果推送到当前 QQ 会话，并提供状态、暂停和上限命令。
+version: v0.1.0
+author: skybot-mutuan
+repo: ""
+support_platforms:
+  - qq_official
