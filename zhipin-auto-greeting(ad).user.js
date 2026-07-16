@@ -4681,10 +4681,16 @@
         navigationResult && navigationResult.exactRestored ||
         Number(latestState.intentionalListRestoreAt || 0) >= returnStartedAt,
       );
+      logDebugEvent('return_refresh_decision', {
+        refreshDecision,
+        intentionalRestore,
+        ignoreListRefresh: Boolean(config.ignoreListRefresh),
+        navigationResult,
+      }, refreshDecision.refreshed ? 'warn' : 'info');
       let cursorIndex = Number(latestState.cursorIndex || currentState.cursorIndex || 0);
 
-      // 主动恢复固定筛选 URL 产生的第一页请求属于预期刷新，不能触发现有的异常暂停逻辑。
-      if (refreshDecision.refreshed && !intentionalRestore) {
+      // 主动恢复固定筛选 URL 仍可能触发列表刷新；是否继续必须交给“无视列表刷新”开关决定。
+      if (refreshDecision.refreshed) {
         if (!config.ignoreListRefresh) {
           this.pause('岗位列表已刷新，脚本已暂停；请确认当前列表后重新启动');
           return;
