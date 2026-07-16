@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
-// @version      0.1.5
+// @version      0.1.6
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
@@ -16,7 +16,7 @@
 /*
  * 项目说明：
  * - 这是运行在 Tampermonkey / 篡改猴中的 BOSS 直聘自动打招呼脚本。
- * - 面板只在岗位列表页 `/web/geek/jobs` 和聊天页 `/web/geek/chat` 显示。
+ * - 面板在岗位列表页 `/web/geek/jobs` 的全部子路由和聊天页 `/web/geek/chat` 显示。
  * - 主流程：岗位列表选择岗位 -> 点击沟通按钮 -> 进入聊天页 -> 发送常用语或自定义文本 -> 返回岗位列表继续。
  * - 支持随机时间间隔、聊天/列表等待上限、已沟通跳过、岗位沟通记录导出与清理。
  * - 岗位记录存储在浏览器 IndexedDB，运行状态存储在 localStorage，用于跨页面跳转后恢复自动化。
@@ -37,7 +37,7 @@
   // 全局常量：集中维护脚本版本、存储 key、BOSS 接口特征和默认问候语。
   const APP = {
     name: 'BOSS自动沟通',
-    version: '0.1.5',
+    version: '0.1.6',
     dbName: 'ZhipinAutoGreetingDB',
     dbVersion: 1,
     configKey: '__zhipin_auto_greeting_config__',
@@ -361,10 +361,46 @@
       if (url.origin !== 'https://www.zhipin.com') return false;
       const pathname = url.pathname.replace(/\/+$/, '');
       if (pathname === '/web/geek/chat') return true;
-      return pathname === '/web/geek/jobs';
+      return isJobListUrl(url.href);
     } catch (_) {
       return false;
     }
+  }
+
+  // 岗位页采用前缀判断，兼容 BOSS 后续增加的 jobs 子路由、查询参数和 hash 路由。
+  function isJobListUrl(href) {
+    try {
+      const url = new URL(href || location.href, location.href);
+      return url.origin === 'https://www.zhipin.com' && /^\/web\/geek\/jobs(?:\/|$)/.test(url.pathname);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // 生成岗位筛选上下文签名；分页、追踪和随机参数不会影响“是否仍是同一筛选页”的判断。
+  function makeJobListFilterSignature(href) {
+    try {
+      const url = new URL(href || location.href, location.href);
+      if (!isJobListUrl(url.href)) return '';
+      const params = Array.from(url.searchParams.entries())
+        .filter(([name]) => !isVolatileJobListParam(name))
+        .sort(([leftName, leftValue], [rightName, rightValue]) => {
+          const nameResult = leftName.localeCompare(rightName);
+          return nameResult || leftValue.localeCompare(rightValue);
+        })
+        .map(([name, value]) => `${encodeURIComponent(name)}=${encodeURIComponent(value)}`)
+        .join('&');
+      const pathname = url.pathname.replace(/\/+$/, '') || '/';
+      return `${url.origin}${pathname}?${params}${url.hash || ''}`;
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function isSameJobListFilterContext(href, expectedUrl, expectedSignature) {
+    const expected = expectedSignature || makeJobListFilterSignature(expectedUrl);
+    const current = makeJobListFilterSignature(href);
+    return Boolean(expected && current && expected === current);
   }
 
   // BOSS 会在聊天页加载后清掉 URL 查询参数；document-start 和 history 阶段先保留原始路由。
@@ -508,7 +544,7 @@
     } catch (_) {}
   }
 
-  // 跨页面自动化状态：记录当前阶段、岗位游标、待发送岗位、返回列表地址和下一次运行时间。
+  // 跨页面自动化状态：记录当前阶段、已处理岗位标识、待发送岗位、固定列表地址和下一次运行时间。
   const RunState = {
     // 从 localStorage 读取运行状态，异常 JSON 直接视为空状态。
     load() {
@@ -3977,19 +4013,29 @@
       }
 
       const startIndex = findSelectedCardIndex();
-      // 启动时从当前选中的岗位附近开始，避免用户已经手动滚动/选择后又从第一页第一个岗位重跑。
+      const listUrl = getRestorableListUrl(location.href) || location.href;
+      const listPosition = captureJobListPosition();
+      // 一轮运行锁定同一个筛选 URL；先回扫顶部，再用岗位标识从上到下累计处理虚拟列表。
       RunState.save({
         active: true,
         phase: 'list',
         cursorIndex: Math.max(0, startIndex),
         sentCount: 0,
         processedKeys: [],
+        scanPhase: 'seeking_top',
+        scanNoProgressCount: 0,
+        scanDiscoveredCount: 0,
         pendingJob: null,
+        pendingJobKey: '',
         nextRunAt: null,
         nextDelaySeconds: null,
         pendingRawJob: null,
         chatButtonText: '',
-        listUrl: location.href,
+        listUrl,
+        listFilterSignature: makeJobListFilterSignature(listUrl),
+        listScrollTop: listPosition.listScrollTop,
+        listAnchorKey: listPosition.listAnchorKey,
+        intentionalListRestoreAt: null,
         returnAttempts: 0,
         returnStartedAt: null,
         stopReason: '',
@@ -4069,7 +4115,7 @@
       this.runListLoop(reason);
     },
 
-    // 列表页主循环：按 cursorIndex 处理岗位卡片，直到停止、达到上限或列表结束。
+    // 列表页主循环：按稳定岗位标识处理卡片，直到停止、达到上限或列表结束。
     async runListLoop(reason) {
       if (runtime.automationLoopActive) return;
 
@@ -4111,27 +4157,53 @@
       }
     },
 
-    // 处理当前游标岗位：等待列表数据、跳过过滤项/已沟通项，或点击沟通进入聊天。
+    // 处理下一个未扫描岗位：岗位标识负责去重，滚动窗口只负责提供当前可点击的 DOM 卡片。
     async processNextCard(state) {
-      let cursorIndex = Number(state.cursorIndex || 0);
+      let currentState = state || RunState.load() || {};
       if (!runtime.jobPool.length) {
         await JobRepository.waitForApiData(1200);
       }
-      let cards = JobRepository.syncCards();
 
-      // 当前已加载卡片不够时向下滚动，等待 BOSS 懒加载更多岗位。
-      while (cursorIndex >= cards.length) {
-        const loaded = await scrollAndWaitForMore(cards.length);
-        cards = JobRepository.syncCards();
-        if (!loaded && cursorIndex >= cards.length) return 'done';
+      if (currentState.scanPhase !== 'scanning_down') {
+        UI.setStatus('正在向上恢复岗位列表顶部...', 'info');
+        await scanJobListToTop();
+        currentState = RunState.patch({
+          scanPhase: 'scanning_down',
+          scanNoProgressCount: 0,
+          cursorIndex: 0,
+          listScrollTop: 0,
+        });
       }
 
-      while (cursorIndex < cards.length) {
-        const card = cards[cursorIndex];
-        const job = runtime.cardJobMap.get(card) || JobRepository.normalizeDomOnlyJob(card, cursorIndex);
-        const domInfo = extractCardInfo(card);
+      while (!runtime.stopRequested) {
+        currentState = RunState.load() || currentState;
+        const processedKeys = getProcessedJobKeySet(currentState);
+        const entries = getVisibleJobScanEntries();
+        const discoveredKeys = new Set(entries.map((entry) => entry.key).filter(Boolean));
+        const nextEntry = entries.find((entry) => entry.key && !processedKeys.has(entry.key));
+
+        RunState.patch({
+          scanDiscoveredCount: Math.max(
+            Number(currentState.scanDiscoveredCount || 0),
+            processedKeys.size + Array.from(discoveredKeys).filter((key) => !processedKeys.has(key)).length,
+          ),
+        });
+
+        if (!nextEntry) {
+          const loaded = await scrollAndWaitForMore(discoveredKeys);
+          const latestState = RunState.load() || currentState;
+          const noProgressCount = loaded ? 0 : Number(latestState.scanNoProgressCount || 0) + 1;
+          RunState.patch(Object.assign({ scanNoProgressCount: noProgressCount }, captureJobListPosition()));
+          if (!loaded && noProgressCount >= 3) return 'done';
+          continue;
+        }
+
+        const { card, job, domInfo, key } = nextEntry;
+        const cursorIndex = Math.max(Number(currentState.cursorIndex || 0), processedKeys.size);
         logDebugEvent('process_card', {
           cursorIndex,
+          scanKey: key,
+          processedCount: processedKeys.size,
           job: summarizeJobForDebug(job),
           domInfo: summarizeDomInfoForDebug(domInfo),
           listState: getDebugListState(),
@@ -4139,16 +4211,14 @@
 
         // 公司筛选、黑名单和已沟通跳过都在点击沟通前完成，减少无意义的详情页/聊天页跳转。
         if (!companyMatches(job.company || domInfo.company)) {
-          cursorIndex += 1;
-          RunState.patch({ cursorIndex });
+          RunState.patch(buildProcessedJobPatch(currentState, job, domInfo, captureJobListPosition(job)));
           continue;
         }
 
         const blacklistDecision = findCompanyBlacklistMatch(job, domInfo.company);
         if (blacklistDecision) {
-          await this.skipCompanyBlacklist(job, cursorIndex, blacklistDecision);
-          cursorIndex += 1;
-          continue;
+          await this.skipCompanyBlacklist(job, cursorIndex, blacklistDecision, domInfo);
+          return 'processed';
         }
 
         if (config.skipContacted && ContactedIndex.has(job)) {
@@ -4159,20 +4229,19 @@
             skippedAt: nowIso(),
             pageUrl: location.href,
           });
-          cursorIndex += 1;
-          RunState.patch({ cursorIndex });
-          scrollAhead(cursorIndex);
-          continue;
+          RunState.patch(buildProcessedJobPatch(currentState, job, domInfo, captureJobListPosition(job)));
+          scrollAheadByJobKey(key);
+          return 'processed';
         }
 
-        return this.communicateWithCard(card, job, cursorIndex);
+        return this.communicateWithCard(card, job, cursorIndex, domInfo);
       }
 
       return 'done';
     },
 
     // 公司黑名单命中时记录跳过原因并推进游标；该状态不会加入已沟通判重集合。
-    async skipCompanyBlacklist(job, cursorIndex, decision) {
+    async skipCompanyBlacklist(job, cursorIndex, decision, domInfo) {
       const rule = decision && decision.rule || {};
       const matchedCompany = normalizeText(decision && decision.company) || getDisplayCompany(job) || '未知公司';
       const modeLabel = getCompanyMatchModeLabel(rule.mode);
@@ -4198,18 +4267,27 @@
         blacklistMatchedCompany: matchedCompany,
         pageUrl: location.href,
       });
-      RunState.patch({ cursorIndex: cursorIndex + 1 });
-      scrollAhead(cursorIndex + 1);
+      const state = RunState.load() || {};
+      const scanKey = getJobScanKey(job, domInfo);
+      RunState.patch(buildProcessedJobPatch(
+        Object.assign({}, state, { pendingJobKey: scanKey || state.pendingJobKey || '' }),
+        job,
+        domInfo,
+        Object.assign(captureJobListPosition(job), { pendingJobKey: '' }),
+      ));
+      scrollAheadByJobKey(scanKey);
       return 'processed';
     },
 
     // 单个岗位的沟通流程：选中卡片、补详情、保存 clicked、点击沟通按钮。
-    async communicateWithCard(card, job, cursorIndex) {
+    async communicateWithCard(card, job, cursorIndex, initialDomInfo) {
+      const cardDomInfo = initialDomInfo || extractCardInfo(card);
+      const scanKey = getJobScanKey(job, cardDomInfo);
       UI.setStatus(`选择岗位：${job.jobName || '未知岗位'} / ${job.company || '未知公司'}`, 'info');
       logDebugEvent('communicate_start', {
         cursorIndex,
         job: summarizeJobForDebug(job),
-        domInfo: summarizeDomInfoForDebug(extractCardInfo(card)),
+        domInfo: summarizeDomInfoForDebug(cardDomInfo),
         runState: RunState.load(),
         listState: getDebugListState(),
       });
@@ -4253,7 +4331,7 @@
 
       const blacklistDecision = findCompanyBlacklistMatch(job);
       if (blacklistDecision) {
-        return this.skipCompanyBlacklist(job, cursorIndex, blacklistDecision);
+        return this.skipCompanyBlacklist(job, cursorIndex, blacklistDecision, cardDomInfo);
       }
 
       const activeDecision = bossActiveMatches(job);
@@ -4274,8 +4352,12 @@
           bossActiveFilterValues: normalizeBossActiveOptions(config.bossActiveFilterValues),
           pageUrl: location.href,
         });
-        RunState.patch({ cursorIndex: cursorIndex + 1 });
-        scrollAhead(cursorIndex + 1);
+        const state = Object.assign({}, RunState.load() || {}, { pendingJobKey: scanKey });
+        RunState.patch(buildProcessedJobPatch(state, job, cardDomInfo, Object.assign(
+          captureJobListPosition(job),
+          { pendingJobKey: '' },
+        )));
+        scrollAheadByJobKey(scanKey);
         return 'processed';
       }
 
@@ -4309,20 +4391,31 @@
           skippedAt: nowIso(),
           pageUrl: location.href,
         });
-        RunState.patch({ cursorIndex: cursorIndex + 1 });
-        scrollAhead(cursorIndex + 1);
+        const state = Object.assign({}, RunState.load() || {}, { pendingJobKey: scanKey });
+        RunState.patch(buildProcessedJobPatch(state, job, cardDomInfo, Object.assign(
+          captureJobListPosition(job),
+          { pendingJobKey: '' },
+        )));
+        scrollAheadByJobKey(scanKey);
         return 'processed';
       }
 
-      // 点击沟通前先保存 pendingJob；聊天页加载后会从 localStorage 取出它并继续发送。
+      // 点击沟通前保存岗位和列表现场；本轮固定的 listUrl 不得被详情或聊天路由覆盖。
+      const currentListState = RunState.load() || {};
+      const listPosition = captureJobListPosition(job);
+      const fixedListUrl = currentListState.listUrl || getRestorableListUrl(location.href) || location.href;
       RunState.patch({
         active: true,
         phase: 'chat',
         cursorIndex,
         pendingJob: flattenJob(job),
+        pendingJobKey: scanKey,
         pendingRawJob: job.rawJob || null,
         chatButtonText: buttonText,
-        listUrl: location.href,
+        listUrl: fixedListUrl,
+        listFilterSignature: currentListState.listFilterSignature || makeJobListFilterSignature(fixedListUrl),
+        listScrollTop: listPosition.listScrollTop,
+        listAnchorKey: listPosition.listAnchorKey || scanKey,
         listSnapshot: createJobListSnapshot(),
         chatOpenRetryCount: 0,
       });
@@ -4332,7 +4425,7 @@
         cursorIndex,
         job: summarizeJobForDebug(job),
         chatButtonText: buttonText,
-        listUrl: location.href,
+        listUrl: fixedListUrl,
       });
       UI.setStatus('已进入聊天页，等待发送...', 'info');
 
@@ -4412,20 +4505,19 @@
         });
         UI.upsertGreetedRecord(sentRecord);
 
-        const nextCursor = Number(state.cursorIndex || 0) + 1;
         const nextDelaySeconds = randomDelaySeconds(config.delayMin, config.delayMax);
-        RunState.patch({
+        RunState.patch(buildProcessedJobPatch(state, pendingJob, null, {
           phase: 'returning',
-          cursorIndex: nextCursor,
           sentCount: Number(state.sentCount || 0) + 1,
           pendingJob: null,
+          pendingJobKey: '',
           pendingRawJob: null,
           returnAttempts: 0,
           returnStartedAt: Date.now(),
           chatOpenRetryCount: 0,
           nextRunAt: Date.now() + nextDelaySeconds * 1000,
           nextDelaySeconds,
-        });
+        }));
 
         await UI.refreshGreetedList({ scrollTop: true });
         UI.setStatus('发送完成，正在返回岗位列表...', 'ok');
@@ -4483,8 +4575,9 @@
         listState: getDebugListState(),
       }, 'warn');
 
-      await navigateToJobList(state && state.listUrl);
+      await navigateToJobList(state);
       await waitForVisibleJobList(Math.max(3000, getWaitTimeout() * 1000));
+      await restoreJobListPosition(state);
       await JobRepository.waitForApiData(Math.min(1800, getWaitTimeout() * 1000));
       const cards = JobRepository.syncCards();
       const card = findJobCardForRetry(pendingJob, cards, Number(state && state.cursorIndex || 0));
@@ -4534,8 +4627,10 @@
         cursorIndex: Number(state && state.cursorIndex || 0),
         pendingJob: flattenJob(refreshedJob),
         pendingRawJob: refreshedJob.rawJob || pendingJob.rawJob || null,
+        pendingJobKey: state && state.pendingJobKey || getJobScanKey(refreshedJob),
         chatButtonText: buttonText,
-        listUrl: location.href,
+        listUrl: state && state.listUrl || getRestorableListUrl(location.href) || location.href,
+        listFilterSignature: state && state.listFilterSignature || makeJobListFilterSignature(state && state.listUrl || location.href),
         listSnapshot: createJobListSnapshot(),
         chatOpenRetryCount: attempt,
       });
@@ -4545,14 +4640,13 @@
         attempt,
         refreshedJob: summarizeJobForDebug(refreshedJob),
         chatButtonText: buttonText,
-        listUrl: location.href,
+        listUrl: state && state.listUrl || location.href,
       });
       await sleep(1000);
     },
 
-    // 发送完成后的返回阶段：使用浏览器历史回到原列表，恢复游标并等待下一次间隔。
+    // 发送完成后先尝试历史返回；只有筛选上下文完全一致才算成功，否则恢复固定的原列表 URL。
     async completeReturnToList(state, reason) {
-      // 发送后只使用浏览器历史返回，保持原搜索结果页的滚动和已加载岗位，不主动 location.assign 刷新列表。
       const currentState = state || RunState.load() || {};
       const attempts = Number(currentState.returnAttempts || 0);
       const returnStartedAt = Number(currentState.returnStartedAt || Date.now());
@@ -4563,24 +4657,39 @@
         hasVisibleJobCards: hasVisibleJobCards(),
         isJobListRoute: isJobListRoute(),
         isChatPage: isChatPage(),
+        listUrl: currentState.listUrl,
+        listFilterSignature: currentState.listFilterSignature,
         ignoreListRefresh: Boolean(config.ignoreListRefresh),
         state: currentState,
       });
 
       RunState.patch({ phase: 'returning', returnAttempts: attempts + 1, returnStartedAt });
-      await navigateToJobList(currentState.listUrl);
+      const navigationResult = await navigateToJobList(currentState);
       await waitForReturnedJobListRefresh(returnStartedAt);
+      await restoreJobListPosition(RunState.load() || currentState);
       logDebugEvent('complete_return_list_visible', {
         reason,
         attempts: attempts + 1,
+        navigationResult,
         listState: getDebugListState(),
         snapshot: createJobListSnapshot(),
       });
 
+      const latestState = RunState.load() || currentState;
       const refreshDecision = this.detectReturnedListRefresh(currentState, returnStartedAt);
-      let cursorIndex = Number((RunState.load() || currentState).cursorIndex || currentState.cursorIndex || 0);
+      const intentionalRestore = Boolean(
+        navigationResult && navigationResult.exactRestored ||
+        Number(latestState.intentionalListRestoreAt || 0) >= returnStartedAt,
+      );
+      logDebugEvent('return_refresh_decision', {
+        refreshDecision,
+        intentionalRestore,
+        ignoreListRefresh: Boolean(config.ignoreListRefresh),
+        navigationResult,
+      }, refreshDecision.refreshed ? 'warn' : 'info');
+      let cursorIndex = Number(latestState.cursorIndex || currentState.cursorIndex || 0);
 
-      // 如果返回后列表刷新，原游标可能已经不可信；默认暂停，用户允许时才从顶部重新跑。
+      // 主动恢复固定筛选 URL 仍可能触发列表刷新；是否继续必须交给“无视列表刷新”开关决定。
       if (refreshDecision.refreshed) {
         if (!config.ignoreListRefresh) {
           this.pause('岗位列表已刷新，脚本已暂停；请确认当前列表后重新启动');
@@ -4591,27 +4700,21 @@
         scrollJobListToTop();
         await sleep(300);
         JobRepository.syncCards();
-        UI.setStatus('检测到岗位列表刷新，已从顶部重新开始', 'warn');
+        UI.setStatus('检测到岗位列表刷新，已保留已处理岗位并从顶部继续', 'warn');
+      } else if (intentionalRestore) {
+        UI.setStatus('已恢复原岗位筛选页面和扫描进度', 'ok');
       }
 
-      const latestState = RunState.load() || currentState;
-      if (!refreshDecision.refreshed) {
-        cursorIndex = Number(latestState.cursorIndex || currentState.cursorIndex || 0);
-      }
       RunState.patch({
         phase: 'list',
         cursorIndex,
         returnAttempts: 0,
         returnStartedAt: null,
+        intentionalListRestoreAt: null,
         listSnapshot: createJobListSnapshot(),
       });
 
       runtime.automationLoopActive = false;
-      if (cursorIndex <= 0) {
-        scrollJobListToTop();
-      } else {
-        scrollAhead(cursorIndex);
-      }
       await UI.refreshGreetedList({ scrollTop: true });
       await this.waitBeforeNextCommunication();
       this.runListLoop(`returned:${reason || 'chat'}`);
@@ -5207,7 +5310,102 @@
     return Array.from(document.querySelectorAll('li.job-card-box')).filter(isVisible);
   }
 
-  // 启动时尽量从当前选中的卡片继续，减少用户手动定位后的重复扫描。
+  // 虚拟列表会反复销毁和创建卡片节点，因此扫描进度必须依赖稳定岗位标识而不是 DOM 下标。
+  function getJobScanKey(job, domInfo) {
+    const reliableKeys = getReliableJobIdentityKeys(job);
+    if (reliableKeys.length) return `id:${reliableKeys[0]}`;
+
+    const domKey = domInfo && (domInfo.keys || []).map(normalizeText).find(Boolean);
+    if (domKey) return `dom:${domKey}`;
+
+    const looseSignature = job && (job.looseSignature || makeLooseSignature(job.jobName, job.company)) ||
+      domInfo && domInfo.looseSignature;
+    if (isMeaningfulCompositeKey(looseSignature)) return `loose:${looseSignature}`;
+
+    const signature = job && (job.signature || makeSignature(job.jobName, job.company, job.salary)) ||
+      domInfo && domInfo.signature;
+    return isMeaningfulCompositeKey(signature) ? `signature:${signature}` : '';
+  }
+
+  function getCardScanEntry(card, index) {
+    const domInfo = extractCardInfo(card);
+    const job = runtime.cardJobMap.get(card) || JobRepository.normalizeDomOnlyJob(card, index);
+    return {
+      card,
+      domInfo,
+      job,
+      key: getJobScanKey(job, domInfo),
+    };
+  }
+
+  function getVisibleJobScanEntries() {
+    return JobRepository.syncCards().map((card, index) => getCardScanEntry(card, index));
+  }
+
+  function getProcessedJobKeySet(state) {
+    return new Set(Array.isArray(state && state.processedKeys) ? state.processedKeys.filter(Boolean) : []);
+  }
+
+  function buildProcessedJobPatch(state, job, domInfo, extra) {
+    const processedKeys = getProcessedJobKeySet(state);
+    const key = getJobScanKey(job, domInfo);
+    const pendingKey = normalizeText(state && state.pendingJobKey);
+    if (pendingKey) processedKeys.add(pendingKey);
+    if (key) processedKeys.add(key);
+    return Object.assign({
+      processedKeys: Array.from(processedKeys),
+      cursorIndex: Math.max(Number(state && state.cursorIndex || 0) + 1, processedKeys.size),
+      scanDiscoveredCount: Math.max(Number(state && state.scanDiscoveredCount || 0), processedKeys.size),
+      scanNoProgressCount: 0,
+    }, extra || {});
+  }
+
+  // 保存真实左栏滚动容器的位置和当前卡片锚点，聊天返回或完整恢复 URL 后可以继续扫描。
+  function captureJobListPosition(preferredJob) {
+    const cards = getJobCards();
+    const preferredKey = getJobScanKey(preferredJob);
+    const anchor = cards.find((card, index) => {
+      if (!preferredKey) return false;
+      return getCardScanEntry(card, index).key === preferredKey;
+    }) || cards.find((card) => /active|selected|cur|current/.test(String(card.className || ''))) || cards[0];
+    const scroller = findScrollParent(anchor) || document.scrollingElement || document.documentElement;
+    const anchorIndex = anchor ? cards.indexOf(anchor) : -1;
+    const anchorEntry = anchorIndex >= 0 ? getCardScanEntry(anchor, anchorIndex) : null;
+    return {
+      listScrollTop: Math.max(0, Number(scroller && scroller.scrollTop || 0)),
+      listAnchorKey: anchorEntry && anchorEntry.key || preferredKey || '',
+    };
+  }
+
+  async function restoreJobListPosition(state) {
+    if (!state || !isJobListRoute()) return false;
+    await waitForVisibleJobList(Math.max(3000, getWaitTimeout() * 1000));
+    JobRepository.syncCards();
+
+    const targetTop = Math.max(0, Number(state.listScrollTop || 0));
+    const anchorKey = normalizeText(state.listAnchorKey);
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const entries = getVisibleJobScanEntries();
+      const anchored = anchorKey && entries.find((item) => item.key === anchorKey);
+      if (anchored) {
+        anchored.card.scrollIntoView({ block: 'center', inline: 'nearest' });
+        return true;
+      }
+
+      const anchor = entries.length ? entries[0].card : document.querySelector('li.job-card-box');
+      const scroller = findScrollParent(anchor) || document.scrollingElement || document.documentElement;
+      if (!scroller || targetTop <= 0) break;
+      const beforeTop = Number(scroller.scrollTop || 0);
+      scroller.scrollTop = targetTop;
+      scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+      await sleep(350);
+      JobRepository.syncCards();
+      if (Number(scroller.scrollTop || 0) >= targetTop - 2 || Number(scroller.scrollTop || 0) <= beforeTop) break;
+    }
+    return Boolean(targetTop > 0);
+  }
+
+  // 保留旧游标字段用于日志和记录兼容；实际扫描进度由 processedKeys 决定。
   function findSelectedCardIndex() {
     const cards = getJobCards();
     const selected = cards.findIndex((card) => {
@@ -6203,51 +6401,61 @@
     return token && normalizeText(getEditableText(input)).includes(token);
   }
 
-  // 从聊天页返回岗位列表。优先保持浏览器历史和原列表滚动，不主动刷新 URL。
-  async function navigateToJobList(listUrl) {
-    if (hasVisibleJobCards()) return true;
-
+  // 从聊天页返回岗位列表。历史返回只有在筛选上下文一致时才成功，否则恢复本轮冻结的完整 URL。
+  async function navigateToJobList(stateOrUrl) {
+    const suppliedState = stateOrUrl && typeof stateOrUrl === 'object' ? stateOrUrl : null;
+    const state = suppliedState || RunState.load() || {};
+    const listUrl = suppliedState ? suppliedState.listUrl : stateOrUrl || state.listUrl;
     const timeout = Math.max(config.ignoreListRefresh ? 15000 : 8000, getWaitTimeout() * 1000);
     const targetListUrl = getRestorableListUrl(listUrl);
+    const expectedSignature = state.listFilterSignature || makeJobListFilterSignature(targetListUrl);
+    const intentionalRestoreAt = Number(state.intentionalListRestoreAt || 0);
 
-    if (isJobListRoute()) {
-      UI.setStatus(config.ignoreListRefresh ? '岗位列表刷新中，正在等待列表恢复...' : '正在等待岗位列表恢复...', 'info');
+    const currentContextMatches = () => Boolean(
+      targetListUrl && isSameJobListFilterContext(location.href, targetListUrl, expectedSignature),
+    );
+
+    if (isJobListRoute() && currentContextMatches()) {
       await waitForVisibleJobList(timeout);
-      return true;
+      return {
+        exactRestored: intentionalRestoreAt > 0,
+        usedHistory: false,
+        href: location.href,
+      };
     }
 
     if (isChatPage()) {
       for (let attempt = 0; attempt < 3; attempt += 1) {
         UI.setStatus(attempt === 0
-          ? '发送完成，正在通过浏览器历史返回岗位列表...'
-          : '仍未看到岗位列表，再次执行浏览器历史返回...', 'info');
+          ? '发送完成，正在通过浏览器历史返回原筛选页...'
+          : '尚未恢复原筛选页，再次执行浏览器历史返回...', 'info');
         const beforeHref = location.href;
         triggerBrowserHistoryBack(attempt);
         try {
           await waitForHistoryReturnOrJobList(beforeHref, Math.min(timeout, 5000 + attempt * 2000));
-          await waitForVisibleJobList(timeout);
-          return true;
+          if (isJobListRoute() && currentContextMatches()) {
+            await waitForVisibleJobList(timeout);
+            return { exactRestored: false, usedHistory: true, href: location.href };
+          }
+          if (isJobListRoute()) break;
         } catch (_) {}
       }
-
-      if (targetListUrl) {
-        UI.setStatus('浏览器历史返回未触发，正在打开原岗位列表页...', 'warn');
-        pageWindow.location.assign(targetListUrl);
-        await waitForVisibleJobList(timeout);
-        return true;
-      }
-
-      throw new Error('浏览器历史返回后未恢复岗位列表，且缺少可恢复的岗位列表地址，请手动返回搜索结果页');
     }
 
     if (targetListUrl) {
-      UI.setStatus('当前不在岗位列表页，正在打开原岗位列表页...', 'warn');
+      UI.setStatus('返回页面的筛选条件已变化，正在恢复原岗位筛选页...', 'warn');
+      RunState.patch({
+        phase: 'returning',
+        intentionalListRestoreAt: Date.now(),
+        listUrl: targetListUrl,
+        listFilterSignature: expectedSignature || makeJobListFilterSignature(targetListUrl),
+      });
       pageWindow.location.assign(targetListUrl);
-      await waitForVisibleJobList(timeout);
-      return true;
+      await waitFor(() => isJobListRoute() && currentContextMatches() && hasVisibleJobCards(), timeout, '原岗位筛选页恢复');
+      return { exactRestored: true, usedHistory: false, href: location.href };
     }
 
-    throw new Error('当前页面不是聊天页，也没有可见岗位列表，请手动返回搜索结果页');
+    throw new Error('缺少可恢复的岗位筛选地址，请手动返回原搜索结果页后重新启动');
   }
 
   // 交替使用 back/go(-1)，应对页面 history 包装导致某一种方式失效。
@@ -6290,7 +6498,7 @@
 
     try {
       const url = new URL(source, location.href);
-      if (url.origin !== location.origin || !/\/web\/geek\/jobs/.test(url.pathname + url.hash)) return '';
+      if (url.origin !== location.origin || !isJobListUrl(url.href)) return '';
       return url.href;
     } catch (_) {
       return '';
@@ -6299,7 +6507,7 @@
 
   // 判断当前是否处于岗位列表路由。
   function isJobListRoute() {
-    return /\/web\/geek\/jobs/.test(location.pathname + location.hash);
+    return isJobListUrl(location.href);
   }
 
   // 判断岗位列表是否真的渲染出可见卡片。
@@ -6410,37 +6618,77 @@
     } catch (_) {}
   }
 
-  // 滚动列表底部并等待 BOSS 懒加载更多岗位卡片。
-  async function scrollAndWaitForMore(previousCount) {
-    const cards = getJobCards();
+  // 启动扫描时先回到真实左栏顶部，确保从页面中部启动也不会遗漏上方岗位。
+  async function scanJobListToTop() {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const cards = JobRepository.syncCards();
+      const anchor = cards[0] || document.querySelector('li.job-card-box');
+      const scroller = findScrollParent(anchor) || document.scrollingElement || document.documentElement;
+      if (!scroller) return false;
+
+      if (anchor) anchor.scrollIntoView({ block: 'start', inline: 'nearest' });
+      scroller.scrollTop = 0;
+      scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+      try {
+        pageWindow.scrollTo(0, 0);
+      } catch (_) {}
+      await sleep(350);
+      JobRepository.syncCards();
+      if (Number(scroller.scrollTop || 0) <= 1) return true;
+    }
+    return false;
+  }
+
+  // 虚拟列表的 DOM 数量通常固定，改为等待新岗位标识、接口批次或真实滚动进展。
+  async function scrollAndWaitForMore(previousKeys) {
+    const entries = getVisibleJobScanEntries();
+    const cards = entries.map((entry) => entry.card);
     const lastCard = cards[cards.length - 1];
     const scroller = findScrollParent(lastCard) || document.scrollingElement || document.documentElement;
+    if (!scroller) return false;
+
+    const knownKeys = previousKeys instanceof Set
+      ? previousKeys
+      : new Set(Array.from(previousKeys || []).filter(Boolean));
+    const beforeTop = Number(scroller.scrollTop || 0);
+    const beforeSerial = Number(runtime.jobListResponseSerial || 0);
+    const beforeBatchKey = runtime.jobListLastBatchKey || '';
 
     if (lastCard) lastCard.scrollIntoView({ block: 'end', inline: 'nearest' });
-    scroller.scrollTop += Math.max(scroller.clientHeight * 0.8, 500);
+    scroller.scrollTop += Math.max(Number(scroller.clientHeight || 0) * 0.8, 500);
     scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
 
+    const hasProgress = () => {
+      const currentKeys = getVisibleJobScanEntries().map((entry) => entry.key).filter(Boolean);
+      if (currentKeys.some((key) => !knownKeys.has(key))) return true;
+      if (Number(runtime.jobListResponseSerial || 0) > beforeSerial) return true;
+      if ((runtime.jobListLastBatchKey || '') !== beforeBatchKey) return true;
+      return Number(scroller.scrollTop || 0) > beforeTop + 2;
+    };
+
     try {
-      await waitFor(() => getJobCards().length > previousCount, Math.min(getWaitTimeout(), 6000), '加载更多岗位');
+      await waitFor(hasProgress, Math.min(getWaitTimeout(), 6000), '加载更多岗位');
       return true;
     } catch (_) {
-      return false;
+      return hasProgress();
     }
   }
 
-  // 跳过岗位后将下一张卡片滚入视野，帮助页面继续懒加载和保持上下文。
-  function scrollAhead(nextIndex) {
-    const cards = getJobCards();
-    const nextCard = cards[nextIndex];
-    if (nextCard) {
-      nextCard.scrollIntoView({ block: 'center', inline: 'nearest' });
-      if (cards.length - nextIndex <= 5) {
-        const scroller = findScrollParent(nextCard);
-        if (scroller) {
-          scroller.scrollTop += 400;
-          scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
-        }
-      }
+  // 跳过岗位后按稳定标识寻找下一张卡片，不再依赖会随虚拟滚动变化的数组游标。
+  function scrollAheadByJobKey(currentKey) {
+    const entries = getVisibleJobScanEntries();
+    const currentIndex = entries.findIndex((entry) => entry.key === currentKey);
+    const nextEntry = currentIndex >= 0 ? entries[currentIndex + 1] : null;
+    if (nextEntry) {
+      nextEntry.card.scrollIntoView({ block: 'center', inline: 'nearest' });
+      return;
+    }
+
+    const anchor = entries.length ? entries[entries.length - 1].card : null;
+    const scroller = findScrollParent(anchor);
+    if (scroller) {
+      scroller.scrollTop += 400;
+      scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
     }
   }
 
