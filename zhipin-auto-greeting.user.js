@@ -103,7 +103,7 @@
     customApiHeaders: '',
     customApiBody: '',
     customApiResponsePath: '',
-    // 自动化策略：跳过已沟通、采集记录、返回列表后是否允许刷新、等待/重试/数量上限。
+    // 自动化策略：跳过已沟通、采集记录、返回列表后是否允许刷新、等待和重试。
     skipContacted: true,
     collectGreetedJobs: true,
     ignoreListRefresh: false,
@@ -111,7 +111,6 @@
     delayMax: 8,
     waitTimeout: 5,
     chatOpenRetries: 2,
-    maxCount: 0,
     // 公司过滤和数据维护选项。
     companyFilterMode: 'partial',
     companyFilterValue: '',
@@ -2544,7 +2543,6 @@
               <label>最大间隔(秒)<input data-field="delayMax" type="number" min="1" step="1"></label>
               <label>等待上限(秒)<input data-field="waitTimeout" type="number" min="2" step="1"></label>
               <label>聊天重试次数<input data-field="chatOpenRetries" type="number" min="0" step="1"></label>
-              <label>最大沟通数<input data-field="maxCount" type="number" min="0" step="1"></label>
             </div>
           </section>
 
@@ -4069,7 +4067,7 @@
       this.runListLoop(reason);
     },
 
-    // 列表页主循环：按 cursorIndex 处理岗位卡片，直到停止、达到上限或列表结束。
+    // 列表页主循环：按 cursorIndex 处理岗位卡片，直到停止或列表结束。
     async runListLoop(reason) {
       if (runtime.automationLoopActive) return;
 
@@ -4086,11 +4084,6 @@
         while (!runtime.stopRequested) {
           const state = RunState.load();
           if (!state || !state.active) break;
-
-          if (Number(config.maxCount) > 0 && Number(state.sentCount || 0) >= Number(config.maxCount)) {
-            this.stop(`已达到最大沟通数：${config.maxCount}`);
-            break;
-          }
 
           const processed = await this.processNextCard(state);
           if (processed === 'navigating') return;
@@ -4641,15 +4634,9 @@
       };
     },
 
-    // 两次沟通之间的随机等待，也负责检查最大沟通数上限。
+    // 两次沟通之间的随机等待。
     async waitBeforeNextCommunication() {
       const state = RunState.load() || {};
-      const maxCount = Number(config.maxCount || 0);
-      if (maxCount > 0 && Number(state.sentCount || 0) >= maxCount) {
-        RunState.patch({ nextRunAt: null, nextDelaySeconds: null });
-        return;
-      }
-
       let nextRunAt = Number(state.nextRunAt || 0);
       let delaySeconds = Number(state.nextDelaySeconds || 0);
       if (!nextRunAt || nextRunAt <= Date.now()) {

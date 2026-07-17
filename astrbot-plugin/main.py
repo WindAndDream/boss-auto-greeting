@@ -45,7 +45,8 @@ class BossJobAssistant(Star):
     async def status(self, event: AstrMessageEvent):
         data = await self._call("GET", "/api/v1/status")
         state = data["state"]
-        yield event.plain_result(f"状态：{'运行中' if state['enabled'] else '已暂停'}\n今日问候：{data['todayCount']} / {state['dailyLimit']}\nQQ 绑定：{'已绑定' if data['bound'] else '未绑定'}")
+        schedule = "今日停止时间已到" if data.get("scheduledStopReached") else f"计划 {state['stopTime']} 停止"
+        yield event.plain_result(f"状态：{'运行许可开启' if state['enabled'] else '已暂停'}\n今日已投递：{data['todayCount']} 条（每 20 条通知）\n停止计划：{schedule}\nQQ 绑定：{'已绑定' if data['bound'] else '未绑定'}")
 
     @job_assistant.command("暂停")
     async def pause(self, event: AstrMessageEvent):
@@ -62,11 +63,11 @@ class BossJobAssistant(Star):
         data = await self._call("GET", "/api/v1/status")
         yield event.plain_result(f"今日已发送 {data['todayCount']} 条，累计保存 {data['total']} 条事件。")
 
-    @job_assistant.command("上限")
-    async def limit(self, event: AstrMessageEvent, count: int):
-        data = await self._call("POST", "/api/v1/control", {"dailyLimit": count})
-        yield event.plain_result(f"每日问候上限已设为 {data['state']['dailyLimit']} 条。")
+    @job_assistant.command("停止时间")
+    async def stop_time(self, event: AstrMessageEvent, time_value: str):
+        data = await self._call("POST", "/api/v1/control", {"stopTime": time_value})
+        yield event.plain_result(f"每日停止时间已设为 {data['state']['stopTime']}。沟通数量不设上限。")
 
     @job_assistant.command("帮助")
     async def help(self, event: AstrMessageEvent):
-        yield event.plain_result("可用命令：\n/求职助手 绑定\n/求职助手 状态\n/求职助手 暂停\n/求职助手 开始\n/求职助手 今日记录\n/求职助手 上限 20\n/求职助手 帮助")
+        yield event.plain_result("可用命令：\n/求职助手 绑定\n/求职助手 状态\n/求职助手 暂停\n/求职助手 开始\n/求职助手 今日记录\n/求职助手 停止时间 18:00\n/求职助手 帮助")

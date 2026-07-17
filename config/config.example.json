@@ -5,5 +5,5 @@
     "apiKey": "",
     "umo": ""
   },
-  "automation": { "dailyLimit": 20, "enabled": true }
+  "automation": { "enabled": true, "stopTime": "18:00", "notifyEvery": 20 }
 }

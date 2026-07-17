@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS 直聘自动问候与 QQ 通知助手
 // @namespace    local.codex.zhipin
-// @version      0.2.0
+// @version      0.3.0
 // @description  筛选岗位、发送首轮问候、保存记录，并通过本机 AstrBot 向 QQ 推送结果。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
@@ -103,7 +103,7 @@
     customApiHeaders: '',
     customApiBody: '',
     customApiResponsePath: '',
-    // 自动化策略：跳过已沟通、采集记录、返回列表后是否允许刷新、等待/重试/数量上限。
+    // 自动化策略：跳过已沟通、采集记录、返回列表后是否允许刷新、等待和重试。
     skipContacted: true,
     collectGreetedJobs: true,
     ignoreListRefresh: false,
@@ -111,7 +111,6 @@
     delayMax: 8,
     waitTimeout: 5,
     chatOpenRetries: 2,
-    maxCount: 0,
     // 公司过滤和数据维护选项。
     companyFilterMode: 'partial',
     companyFilterValue: '',
@@ -2544,7 +2543,6 @@
               <label>最大间隔(秒)<input data-field="delayMax" type="number" min="1" step="1"></label>
               <label>等待上限(秒)<input data-field="waitTimeout" type="number" min="2" step="1"></label>
               <label>聊天重试次数<input data-field="chatOpenRetries" type="number" min="0" step="1"></label>
-              <label>最大沟通数<input data-field="maxCount" type="number" min="0" step="1"></label>
             </div>
           </section>
 
@@ -4069,7 +4067,7 @@
       this.runListLoop(reason);
     },
 
-    // 列表页主循环：按 cursorIndex 处理岗位卡片，直到停止、达到上限或列表结束。
+    // 列表页主循环：按 cursorIndex 处理岗位卡片，直到停止或列表结束。
     async runListLoop(reason) {
       if (runtime.automationLoopActive) return;
 
@@ -4086,11 +4084,6 @@
         while (!runtime.stopRequested) {
           const state = RunState.load();
           if (!state || !state.active) break;
-
-          if (Number(config.maxCount) > 0 && Number(state.sentCount || 0) >= Number(config.maxCount)) {
-            this.stop(`已达到最大沟通数：${config.maxCount}`);
-            break;
-          }
 
           const processed = await this.processNextCard(state);
           if (processed === 'navigating') return;
@@ -4641,15 +4634,9 @@
       };
     },
 
-    // 两次沟通之间的随机等待，也负责检查最大沟通数上限。
+    // 两次沟通之间的随机等待。
     async waitBeforeNextCommunication() {
       const state = RunState.load() || {};
-      const maxCount = Number(config.maxCount || 0);
-      if (maxCount > 0 && Number(state.sentCount || 0) >= maxCount) {
-        RunState.patch({ nextRunAt: null, nextDelaySeconds: null });
-        return;
-      }
-
       let nextRunAt = Number(state.nextRunAt || 0);
       let delaySeconds = Number(state.nextDelaySeconds || 0);
       if (!nextRunAt || nextRunAt <= Date.now()) {
@@ -8431,13 +8418,30 @@
   'use strict';
   const SETTINGS_KEY = '__boss_qq_bridge_settings__';
   const SENT_KEY = '__boss_qq_bridge_sent__';
-  const defaults = { url: 'http://127.0.0.1:17861', token: '', enabled: true };
+  const REPLY_SEEN_KEY = '__boss_qq_reply_seen__';
+  const defaults = { url: 'http://127.0.0.1:17861', token: '', enabled: true, stopTime: '18:00' };
   const settings = Object.assign({}, defaults, safeJson(localStorage.getItem(SETTINGS_KEY), {}));
+  if (!settings.token && defaults.token) {
+    settings.token = defaults.token;
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  }
   let sent = new Set(safeJson(localStorage.getItem(SENT_KEY), []));
+  let replySeen = new Set(safeJson(localStorage.getItem(REPLY_SEEN_KEY), []));
+  let replyMonitorReady = false;
 
   function safeJson(value, fallback) { try { return JSON.parse(value || '') || fallback; } catch { return fallback; } }
   function saveSettings() { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); }
   function remember(id) { sent.add(id); if (sent.size > 2000) sent = new Set([...sent].slice(-1500)); localStorage.setItem(SENT_KEY, JSON.stringify([...sent])); }
+  function rememberReply(id) { replySeen.add(id); if (replySeen.size > 1200) replySeen = new Set([...replySeen].slice(-900)); localStorage.setItem(REPLY_SEEN_KEY, JSON.stringify([...replySeen])); }
+  function normalizeReplyText(value) { return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 240); }
+  function fingerprint(value) { let hash=2166136261; for(const char of String(value)){hash^=char.codePointAt(0);hash=Math.imul(hash,16777619);} return (hash>>>0).toString(36); }
+  function isValidStopTime(value) { return /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(String(value || '')); }
+  function isStopTimeReached(value) {
+    if (!isValidStopTime(value)) return false;
+    const now = new Date();
+    const current = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    return current >= value;
+  }
   function request(method, pathname, body) {
     return new Promise((resolve, reject) => GM_xmlhttpRequest({
       method, url: `${settings.url.replace(/\/$/, '')}${pathname}`,
@@ -8460,31 +8464,109 @@
   async function syncRecords() {
     if (!settings.enabled || !settings.token) return;
     const records=(await getAllRecords()).filter(r=>r && r.status==='sent' && !sent.has(r.id)).sort((a,b)=>String(a.sentAt||'').localeCompare(String(b.sentAt||'')));
-    for(const record of records){ try { await request('POST','/api/v1/events',toEvent(record)); remember(record.id); const status=await request('GET','/api/v1/status'); if(status.todayCount>=status.state.dailyLimit){ emergencyStop('已达到本日问候上限'); break; } } catch(error) { if(error.message==='daily_limit_reached') emergencyStop('已达到本日问候上限'); break; } }
+    for(const record of records){ try { await request('POST','/api/v1/events',toEvent(record)); remember(record.id); } catch { break; } }
   }
   async function syncControl() {
     if (!settings.enabled || !settings.token) return;
-    try { const status=await request('GET','/api/v1/status'); if(!status.state.enabled) stopOnce('任务已由 QQ 或本地状态暂停'); else if(status.todayCount>=status.state.dailyLimit) stopOnce('已达到本日问候上限'); } catch {}
+    if (isStopTimeReached(settings.stopTime)) {
+      stopOnce(`已到计划停止时间 ${settings.stopTime}`);
+      return;
+    }
+    try {
+      const status=await request('GET','/api/v1/status');
+      if (isValidStopTime(status.state?.stopTime) && settings.stopTime !== status.state.stopTime) {
+        settings.stopTime=status.state.stopTime;
+        saveSettings();
+        const input=document.querySelector('#boss-qq-bridge-panel [data-bridge="stopTime"]');
+        if(input) input.value=settings.stopTime;
+      }
+      if(!status.state.enabled) stopOnce('任务已由 QQ 或本地状态暂停');
+      else if(status.scheduledStopReached) stopOnce(`已到计划停止时间 ${status.state.stopTime}`);
+    } catch {}
   }
-  function stopOnce(reason) { if(sessionStorage.getItem('__boss_qq_last_stop__')===reason)return; sessionStorage.setItem('__boss_qq_last_stop__',reason); emergencyStop(reason); }
-  function emergencyStop(reason) {
+  function currentConversationContext() {
+    const selected=document.querySelector('.user-list-content li.selected, .user-list-content li.active, .user-list li.selected, .user-list li.active, .chat-user li.selected, .chat-user li.active, .friend-content.selected, .friend-content.active, .friend-content-warp.selected, .friend-content-warp.active');
+    return normalizeReplyText(selected?.innerText || selected?.textContent || document.title).slice(0,120);
+  }
+  async function sendReplyAlert(id, message, context) {
+    if(replySeen.has(id)) return;
+    rememberReply(id);
+    try {
+      await request('POST','/api/v1/events',{type:'reply.received',status:'HR 有新回复',company:context,message,reason:`回复内容：${message}`,jobUrl:location.href});
+    } catch {
+      replySeen.delete(id);
+      localStorage.setItem(REPLY_SEEN_KEY, JSON.stringify([...replySeen]));
+    }
+  }
+  function scanHrReplies() {
+    if(!settings.enabled || !settings.token) return;
+    const context=currentConversationContext();
+    const incoming=Array.from(document.querySelectorAll([
+      '.chat-record .item-friend',
+      '.chat-message-list .item-friend',
+      '.chat-message .item-friend',
+      '.chat-record .message-item.friend',
+      '.chat-record .message-item.other',
+      '.chat-record .message-item.received',
+      '.chat-message-list .message-item.friend',
+      '.chat-message-list .message-item.other',
+      '.chat-message-list .message-item.received',
+    ].join(',')));
+    const activeReplies=incoming.map(node=>{
+      const message=normalizeReplyText(node.innerText || node.textContent);
+      const stable=node.getAttribute('data-id') || node.getAttribute('data-message-id') || node.id || message;
+      return {id:`active:${fingerprint(`${context}|${stable}|${message}`)}`,message};
+    }).filter(item=>item.message.length>0);
+    if(!replyMonitorReady){activeReplies.forEach(item=>rememberReply(item.id));replyMonitorReady=true;}
+    else activeReplies.filter(item=>!replySeen.has(item.id)).forEach(item=>sendReplyAlert(item.id,item.message,context));
+
+    const conversations=Array.from(document.querySelectorAll('.user-list-content li, .user-list li, .chat-user li, .friend-content, .friend-content-warp'));
+    conversations.filter(item=>item.matches('.unread, [class*="unread"]') || item.querySelector('.unread, [class*="unread"], .badge, [class*="badge"]') || /未读/.test(item.innerText || '')).forEach(item=>{
+      const message=normalizeReplyText(item.innerText || item.textContent);
+      if(!message) return;
+      const id=`unread:${fingerprint(message)}`;
+      if(!replySeen.has(id)) sendReplyAlert(id,message,message.slice(0,120));
+    });
+  }
+  function stopOnce(reason) {
     const button=document.querySelector('#zhipin-auto-greeting-root [data-action="stop"], #zhipin-auto-greeting-root [data-action="emergencyStop"]');
-    if(button && !button.disabled) button.click();
+    if(!button || button.disabled || sessionStorage.getItem('__boss_qq_last_stop__')===reason) return;
+    sessionStorage.setItem('__boss_qq_last_stop__',reason);
+    button.click();
     request('POST','/api/v1/events',{type:'system.stopped',status:'已自动停止',reason,jobUrl:location.href}).catch(()=>{});
   }
   function safetyCheck() {
     const text=(document.body?.innerText||'').slice(0,12000);
-    const reason=/验证码|安全验证|完成验证/.test(text)?'检测到验证码或安全验证':(/登录|扫码登录/.test(text)&&/请.*登录|登录后/.test(text)?'BOSS 登录状态可能已失效':'');
-    if(reason && settings.enabled && sessionStorage.getItem('__boss_qq_last_stop__')!==reason){ sessionStorage.setItem('__boss_qq_last_stop__',reason); emergencyStop(reason); }
+    const reason=/验证码|安全验证|完成验证/.test(text)?'检测到验证码或安全验证':(/登录|扫码登录/.test(text)&&/请\s*登录|登录后/.test(text)?'BOSS 登录状态可能已失效':'');
+    if(reason) stopOnce(reason);
+  }
+  function applyStatus(section, result) {
+    if (isValidStopTime(result.state?.stopTime)) {
+      settings.stopTime=result.state.stopTime;
+      saveSettings();
+      section.querySelector('[data-bridge="stopTime"]').value=settings.stopTime;
+    }
+    section.querySelector('[data-bridge-status]').textContent=`连接正常；今日已投递 ${result.todayCount} 条，每 20 条通知；${result.state.enabled ? '运行许可开启' : '已暂停'}；${result.state.stopTime} 停止`;
   }
   function mount() {
     const root=document.querySelector('#zhipin-auto-greeting-root .za-panel'); if(!root || document.getElementById('boss-qq-bridge-panel')) return;
     const section=document.createElement('section'); section.className='za-section'; section.id='boss-qq-bridge-panel';
-    section.innerHTML=`<h3>QQ 通知桥接</h3><label>桥接地址<input data-bridge="url" value="${escapeHtml(settings.url)}"></label><label>桥接令牌<input data-bridge="token" type="password" placeholder="config/config.json 中的 token"></label><div class="za-inline"><button type="button" data-bridge-action="save">保存</button><button type="button" data-bridge-action="test">测试连接</button></div><small data-bridge-status>尚未连接</small>`;
+    section.innerHTML=`<h3>QQ 通知桥接</h3><label>桥接地址<input data-bridge="url" value="${escapeHtml(settings.url)}"></label><label>桥接令牌<input data-bridge="token" type="password" placeholder="自动读取本机配置"></label><label>每日停止时间<input data-bridge="stopTime" type="time" step="60" value="${escapeHtml(settings.stopTime)}"></label><p class="za-hint">沟通数量不设上限；每完成 20 条向 QQ 汇报一次；检测到 HR 新回复时立即特别提醒，没有回复时保持静默。</p><div class="za-inline"><button type="button" data-bridge-action="save">保存</button><button type="button" data-bridge-action="test">测试连接</button></div><small data-bridge-status>正在读取状态…</small>`;
     section.querySelector('[data-bridge="token"]').value=settings.token;
-    section.addEventListener('click',async event=>{ const action=event.target?.dataset?.bridgeAction; if(!action)return; const status=section.querySelector('[data-bridge-status]'); settings.url=section.querySelector('[data-bridge="url"]').value.trim()||defaults.url; settings.token=section.querySelector('[data-bridge="token"]').value.trim(); saveSettings(); if(action==='save'){status.textContent='已保存';return;} status.textContent='连接中…'; try{const result=await request('GET','/api/v1/status');status.textContent=`连接正常，今日 ${result.todayCount}/${result.state.dailyLimit}`;}catch(error){status.textContent=`连接失败：${error.message}`;}});
+    section.addEventListener('click',async event=>{
+      const action=event.target?.dataset?.bridgeAction; if(!action)return;
+      const status=section.querySelector('[data-bridge-status]');
+      settings.url=section.querySelector('[data-bridge="url"]').value.trim()||defaults.url;
+      settings.token=section.querySelector('[data-bridge="token"]').value.trim();
+      settings.stopTime=section.querySelector('[data-bridge="stopTime"]').value.trim();
+      if(!isValidStopTime(settings.stopTime)){status.textContent='请选择有效的停止时间';return;}
+      saveSettings(); status.textContent=action==='save'?'正在保存…':'连接中…';
+      try { await request('POST','/api/v1/control',{stopTime:settings.stopTime}); const result=await request('GET','/api/v1/status'); applyStatus(section,result); }
+      catch(error){status.textContent=`连接失败：${error.message}`;}
+    });
     root.insertBefore(section,root.lastElementChild);
+    if(settings.token) request('GET','/api/v1/status').then(result=>applyStatus(section,result)).catch(error=>{section.querySelector('[data-bridge-status]').textContent=`连接失败：${error.message}`;});
   }
   function escapeHtml(value){return String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-  setInterval(()=>{mount();syncRecords();syncControl();safetyCheck();},5000);
+  setInterval(()=>{mount();syncRecords();syncControl();scanHrReplies();safetyCheck();},5000);
 })();

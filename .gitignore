@@ -3,6 +3,7 @@ bridge/data/*.json
 config/config.json
 config/.env
 dist/*.zip
+dist/*.personal.user.js
 *.log
 __pycache__/
 *.pyc
