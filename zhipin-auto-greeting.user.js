@@ -6643,13 +6643,24 @@
     ));
   }
 
+  // 在弹窗根节点里找关闭控件；部分 BOSS 弹窗的关闭按钮不是 button/a，只在图标上挂事件。
+  function findDialogCloseControl(root) {
+    if (!root) return null;
+    const selectors = '[class*="close"], [aria-label*="关闭"], [aria-label*="close"], [title*="关闭"], .icon-close';
+    return Array.from(root.querySelectorAll(selectors))
+      .filter((element) => !isOwnUiElement(element) && isVisible(element))
+      .map((element) => element.closest('button, a, [role="button"]') || element)
+      .find(Boolean) || null;
+  }
+
   // “已向BOSS发送消息”表示 BOSS 已经自动发出招呼语；脚本只点击“留在本页”，
   // 避免进入聊天页后把配置的问候语再发一遍。找不到留在按钮时再尝试关闭弹窗。
-  function findGreetingSentActionButton(buttons) {
+  function findGreetingSentActionButton(root, buttons) {
     const stay = /^(留在本页|留在此页|留在当前页)$/;
     const dismiss = /^(知道了|确定|关闭)$/;
     return buttons.find((button) => stay.test(getDialogButtonLabel(button))) ||
       buttons.find((button) => /关闭|close/i.test(normalizeText(button.getAttribute('aria-label') || button.getAttribute('title') || ''))) ||
+      findDialogCloseControl(root) ||
       buttons.find((button) => dismiss.test(getDialogButtonLabel(button)));
   }
 
@@ -6708,7 +6719,7 @@
         const label = getDialogButtonLabel(button);
         return /确定|知道了|我知道了/.test(label) && !/取消|开通|升级|购买|查看权益/.test(label);
       });
-      const actionButton = greetingSent ? findGreetingSentActionButton(buttons) : null;
+      const actionButton = greetingSent ? findGreetingSentActionButton(root, buttons) : null;
 
       const kind = hardLimit ? 'hard_limit' : greetingSent ? 'greeting_sent' : 'soft_reminder';
       // 硬限制优先级最高：同屏同时出现多个弹窗时也要先暂停，不能继续点“继续沟通”。
