@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BOSS直聘自动沟通助手
 // @namespace    local.codex.zhipin
-// @version      0.1.9
+// @version      0.1.10
 // @description  在 BOSS 直聘搜索结果页自动选择岗位、发送常用语或自定义问候语，并记录岗位数据。
 // @match        https://www.zhipin.com/web/geek/jobs*
 // @match        https://www.zhipin.com/web/geek/chat*
@@ -20,6 +20,7 @@
  * - 主流程：岗位列表选择岗位 -> 点击沟通按钮 -> 进入聊天页 -> 发送常用语或自定义文本 -> 返回岗位列表继续。
  * - 支持随机时间间隔、聊天/列表等待上限、已沟通跳过、岗位沟通记录导出与清理。
  * - 列表耗尽后可自动刷新页面续跑；沟通次数提醒弹窗会自动点击确定，硬限制则暂停。
+ * - 点击沟通后出现“已向BOSS发送消息”弹窗时，会自动点击“留在本页”，避免重复发送并继续下一个岗位。
  * - 岗位记录存储在浏览器 IndexedDB，运行状态存储在 localStorage，用于跨页面跳转后恢复自动化。
  *
  * 维护定位：
@@ -38,7 +39,7 @@
   // 全局常量：集中维护脚本版本、存储 key、BOSS 接口特征和默认问候语。
   const APP = {
     name: 'BOSS自动沟通',
-    version: '0.1.9',
+    version: '0.1.10',
     dbName: 'ZhipinAutoGreetingDB',
     dbVersion: 1,
     configKey: '__zhipin_auto_greeting_config__',
@@ -4549,6 +4550,10 @@
         if (dialog && dialog.kind === 'hard_limit') {
           throw createPauseError(formatBossDialogPauseMessage(dialog));
         }
+        // 弹窗已点“留在本页”，本轮不会进入聊天页，直接结束等待交给收尾逻辑。
+        if (dialog && dialog.kind === 'greeting_sent') {
+          return { type: 'greeting-sent', dialog };
+        }
         return isChatPage() ? 'same-page' : null;
       }, getWaitTimeout(), '聊天页跳转', {
         observerRoot: getPageObserverRoot(),
@@ -4560,12 +4565,17 @@
         resolveOnPageHide: true,
         pageHideResult: 'pagehide',
       }).then((transition) => {
+        const greetingSent = Boolean(transition && typeof transition === 'object' && transition.type === 'greeting-sent');
         logDebugEvent('chat_page_transition_observed', {
-          transition,
+          transition: greetingSent ? 'greeting-sent' : transition,
           href: location.href,
           job: summarizeJobForDebug(job),
           runState: RunState.load(),
         });
+        if (greetingSent) {
+          this.handlePlatformGreeting(transition.dialog, job, 'greeting-sent');
+          return;
+        }
         if (transition !== 'same-page' || !isChatPage()) return;
 
         const latestState = RunState.load();
@@ -4577,6 +4587,10 @@
         }
       }).catch((error) => {
         const latestState = RunState.load();
+        if (error && error.zhipinGreetingSent) {
+          this.handlePlatformGreeting(error.platformDialog, job, 'chat-transition-greeting-sent');
+          return;
+        }
         if (error && error.zhipinAutoPause) {
           runtime.automationLoopActive = false;
           this.pause(error.message || '已暂停');
@@ -4595,6 +4609,11 @@
             text: summarizeLongText(dialog.text),
           },
         }, 'warn');
+
+        if (dialog && dialog.kind === 'greeting_sent') {
+          this.handlePlatformGreeting(dialog, job, 'chat-transition-timeout');
+          return;
+        }
 
         if (dialog && dialog.kind === 'hard_limit') {
           runtime.automationLoopActive = false;
@@ -4663,6 +4682,11 @@
         if (dialog && dialog.kind === 'hard_limit') {
           throw createPauseError(formatBossDialogPauseMessage(dialog));
         }
+        // 弹窗选择“留在本页”后 BOSS 已经发过招呼语，不能再进入发送流程。
+        if (dialog && dialog.kind === 'greeting_sent') {
+          await this.handlePlatformGreeting(dialog, pendingJob, 'continue-from-chat');
+          return;
+        }
 
         const sendResult = await this.sendCurrentWithChatOpenRetries(pendingJob, state);
         // 只有发送确认通过后才写入 sent，并同步更新已沟通列表。
@@ -4695,12 +4719,77 @@
         await this.completeReturnToList(RunState.load(), reason || 'chat');
       } catch (error) {
         runtime.automationLoopActive = false;
-        if (error && error.zhipinAutoPause) {
+        if (error && error.zhipinGreetingSent) {
+          await this.handlePlatformGreeting(error.platformDialog, null, 'chat-greeting-sent');
+        } else if (error && error.zhipinAutoPause) {
           this.pause(error.message || '已暂停');
         } else {
           this.fatal(error.message || String(error));
         }
       }
+    },
+
+    // BOSS 已经自动发送招呼语时的统一收尾入口：记录岗位、恢复列表循环，异常转 fatal 防止悬挂。
+    async handlePlatformGreeting(dialog, jobHint, reason) {
+      runtime.automationLoopActive = false;
+      try {
+        await this.completePlatformGreeting(dialog, jobHint, reason);
+      } catch (error) {
+        this.fatal(error.message || String(error));
+      }
+    },
+
+    // 平台弹窗选择“留在本页”后，本轮不会进入聊天页；这里记录已沟通并复用返回列表流程。
+    async completePlatformGreeting(dialog, jobHint, reason) {
+      const state = RunState.load();
+      if (!state || !state.active || state.phase !== 'chat' || !state.pendingJob) {
+        logDebugEvent('platform_greeting_ignored', {
+          reason,
+          state,
+          dialog: dialog && {
+            kind: dialog.kind,
+            text: summarizeLongText(dialog.text),
+          },
+        }, 'warn');
+        return;
+      }
+
+      const pendingJob = jobHint || revivePendingJob(state);
+      const record = await Database.saveJobRecord(pendingJob, {
+        status: 'sent',
+        sentAt: nowIso(),
+        messageType: 'platformGreeting',
+        messagePreview: 'BOSS 已自动发送招呼语',
+        chatButtonText: state.chatButtonText,
+        pageUrl: location.href,
+      });
+      UI.upsertGreetedRecord(record);
+
+      const nextDelaySeconds = randomDelaySeconds(config.delayMin, config.delayMax);
+      RunState.patch(buildProcessedJobPatch(state, pendingJob, null, {
+        phase: 'returning',
+        sentCount: Number(state.sentCount || 0) + 1,
+        pendingJob: null,
+        pendingJobKey: '',
+        pendingRawJob: null,
+        returnAttempts: 0,
+        returnStartedAt: Date.now(),
+        chatOpenRetryCount: 0,
+        nextRunAt: Date.now() + nextDelaySeconds * 1000,
+        nextDelaySeconds,
+      }));
+
+      await UI.refreshGreetedList({ scrollTop: true });
+      UI.setStatus('BOSS 已自动发送招呼语，已留在本页并继续下一个岗位', 'ok');
+      logDebugEvent('platform_greeting_handled', {
+        reason,
+        pendingJob: summarizeJobForDebug(pendingJob),
+        dialog: dialog && {
+          kind: dialog.kind,
+          text: summarizeLongText(dialog.text),
+        },
+      });
+      await this.completeReturnToList(RunState.load(), reason || 'greeting-sent');
     },
 
     // 发送时如果聊天输入框渲染超时，可返回列表重新点击同一岗位进行有限重试。
@@ -4722,11 +4811,16 @@
             listState: getDebugListState(),
           }, 'warn');
 
+          if (error && error.zhipinGreetingSent) throw error;
+
           if (!isChatRenderTimeoutError(error) || attempts >= maxRetries) {
-            // 最后一次聊天超时时再尝试关闭软提醒；硬限制转暂停而不是 fatal。
+            // 最后一次聊天超时时再尝试关闭软提醒；硬限制转暂停，招呼语已发送则交给上层收尾。
             const dialog = inspectBossPlatformDialog({ dismissSoft: true });
             if (dialog && dialog.kind === 'hard_limit') {
               throw createPauseError(formatBossDialogPauseMessage(dialog));
+            }
+            if (dialog && dialog.kind === 'greeting_sent') {
+              throw createGreetingSentError(dialog);
             }
             throw error;
           }
@@ -6534,7 +6628,32 @@
     return error;
   }
 
-  // 识别 BOSS 沟通相关平台弹窗（温馨提示 / 次数用尽等），排除脚本自己的确认框。
+  // 平台已经自动发送招呼语时用于中断聊天等待；调用方负责记录岗位并回到列表。
+  function createGreetingSentError(dialog) {
+    const error = new Error('BOSS 已发送招呼语，留在本页');
+    error.zhipinGreetingSent = true;
+    error.platformDialog = dialog || null;
+    return error;
+  }
+
+  // 读取弹窗按钮文案：兼容文字按钮和只有 aria-label/title 的图标按钮。
+  function getDialogButtonLabel(button) {
+    return normalizeText(button && (
+      button.innerText || button.textContent || button.getAttribute('aria-label') || button.getAttribute('title') || ''
+    ));
+  }
+
+  // “已向BOSS发送消息”表示 BOSS 已经自动发出招呼语；脚本只点击“留在本页”，
+  // 避免进入聊天页后把配置的问候语再发一遍。找不到留在按钮时再尝试关闭弹窗。
+  function findGreetingSentActionButton(buttons) {
+    const stay = /^(留在本页|留在此页|留在当前页)$/;
+    const dismiss = /^(知道了|确定|关闭)$/;
+    return buttons.find((button) => stay.test(getDialogButtonLabel(button))) ||
+      buttons.find((button) => /关闭|close/i.test(normalizeText(button.getAttribute('aria-label') || button.getAttribute('title') || ''))) ||
+      buttons.find((button) => dismiss.test(getDialogButtonLabel(button)));
+  }
+
+  // 识别 BOSS 沟通相关平台弹窗（温馨提示 / 次数用尽 / 已向BOSS发送消息等），排除脚本自己的确认框。
   function findBossPlatformDialog() {
     const selectorRoots = Array.from(document.querySelectorAll([
       '[role="dialog"]',
@@ -6544,6 +6663,9 @@
       '.dialog-container',
       '.dialog-layer',
       '.boss-popup',
+      '[class*="boss-popup"]',
+      '[class*="dialog-wrap"]',
+      '[class*="boss-dialog"]',
       '.confirm-dialog',
       '.ui-dialog',
     ].join(','))).filter((element) => !isOwnUiElement(element) && isVisible(element));
@@ -6563,31 +6685,45 @@
     let best = null;
     for (const root of roots) {
       const text = normalizeText(root.innerText || root.textContent || '');
-      if (!text || text.length < 6 || text.length > 500) continue;
+      // 弹窗里可能带完整的招呼语预览，长度上限留足空间；整页容器仍会被这个阈值排除。
+      if (!text || text.length < 6 || text.length > 800) continue;
 
       const softReminder = /温馨提示/.test(text) && /沟通/.test(text)
         || /还剩\s*\d+\s*次沟通/.test(text)
         || /您今天已与\s*\d+\s*位/.test(text)
         || /沟通机会/.test(text) && /今天已与|还剩/.test(text);
       const hardLimit = /今日沟通(?:次数)?已(?:用完|达上限)|沟通次数(?:已)?(?:用完|达上限)|无法继续沟通|今日无法再沟通|已达(?:到)?沟通上限/.test(text);
-      if (!softReminder && !hardLimit) continue;
+      // 点击沟通后 BOSS 会先自动发送招呼语，再弹出“已向BOSS发送消息”让用户选择留在本页或继续沟通。
+      // 不处理这个弹窗时，页面不会跳转聊天页，流程会一直等到超时。
+      const greetingSent = /已向\s*(?:boss|BOSS)\s*发送(?:了|过)?\s*消息/i.test(text)
+        && /继续沟通|留在本页|留在此页|留在当前页|设置招呼语/.test(text);
+      if (!softReminder && !hardLimit && !greetingSent) continue;
 
-      const buttons = Array.from(root.querySelectorAll('button, a, [role="button"], .btn, [class*="btn"]'))
+      const buttons = Array.from(root.querySelectorAll('button, a, [role="button"], .btn, [class*="btn"], [class*="button"]'))
         .filter((button) => !isOwnUiElement(button) && isVisible(button));
       const confirmButton = buttons.find((button) => {
-        const label = normalizeText(button.innerText || button.textContent || button.getAttribute('aria-label') || '');
+        const label = getDialogButtonLabel(button);
         return /^(确定|知道了|我知道了|继续|关闭)$/.test(label);
       }) || buttons.find((button) => {
-        const label = normalizeText(button.innerText || button.textContent || button.getAttribute('aria-label') || '');
+        const label = getDialogButtonLabel(button);
         return /确定|知道了|我知道了/.test(label) && !/取消|开通|升级|购买|查看权益/.test(label);
       });
+      const actionButton = greetingSent ? findGreetingSentActionButton(buttons) : null;
 
-      const score = (hardLimit ? 4 : 0) + (softReminder ? 2 : 0) + (confirmButton ? 1 : 0) + Math.min(text.length, 80) / 80;
+      const kind = hardLimit ? 'hard_limit' : greetingSent ? 'greeting_sent' : 'soft_reminder';
+      // 硬限制优先级最高：同屏同时出现多个弹窗时也要先暂停，不能继续点“继续沟通”。
+      const score = (kind === 'hard_limit' ? 10 : 0) +
+        (kind === 'greeting_sent' ? 6 : 0) +
+        (softReminder ? 2 : 0) +
+        (actionButton ? 1 : 0) +
+        (confirmButton ? 1 : 0) +
+        Math.min(text.length, 80) / 80;
       if (!best || score > best.score) {
         best = {
           root,
           text,
-          kind: hardLimit ? 'hard_limit' : 'soft_reminder',
+          kind,
+          actionButton,
           confirmButton: confirmButton || null,
           score,
         };
@@ -6604,20 +6740,33 @@
     return short ? `沟通受限，已暂停：${short}` : '沟通次数已达上限，已暂停';
   }
 
-  // 检查并处理平台弹窗：软提醒可点击确定；硬限制只返回结果，由调用方 pause。
+  // 检查并处理平台弹窗：软提醒点击确定；“已向BOSS发送消息”点击留在本页；硬限制只返回结果，由调用方 pause。
   function inspectBossPlatformDialog(options) {
     const settings = options || {};
     const dialog = findBossPlatformDialog();
     if (!dialog) return null;
 
-    if (dialog.kind === 'soft_reminder' && settings.dismissSoft && dialog.confirmButton) {
+    if (dialog.kind === 'greeting_sent' && settings.dismissSoft && dialog.actionButton) {
+      const lastAt = Number(runtime.lastBossDialogDismissAt || 0);
+      if (Date.now() - lastAt > 900) {
+        const buttonText = getDialogButtonLabel(dialog.actionButton);
+        UI.setStatus('检测到“已向BOSS发送消息”弹窗，正在留在本页...', 'info');
+        logDebugEvent('boss_platform_dialog_stay', {
+          kind: dialog.kind,
+          text: summarizeLongText(dialog.text),
+          buttonText,
+        });
+        clickElement(dialog.actionButton);
+        runtime.lastBossDialogDismissAt = Date.now();
+      }
+    } else if (dialog.kind === 'soft_reminder' && settings.dismissSoft && dialog.confirmButton) {
       const lastAt = Number(runtime.lastBossDialogDismissAt || 0);
       if (Date.now() - lastAt > 900) {
         UI.setStatus('检测到沟通提醒弹窗，正在点击确定...', 'warn');
         logDebugEvent('boss_platform_dialog_dismiss', {
           kind: dialog.kind,
           text: summarizeLongText(dialog.text),
-          buttonText: normalizeText(dialog.confirmButton.innerText || dialog.confirmButton.textContent || ''),
+          buttonText: getDialogButtonLabel(dialog.confirmButton),
         });
         clickElement(dialog.confirmButton);
         runtime.lastBossDialogDismissAt = Date.now();
@@ -6652,6 +6801,10 @@
       const dialog = inspectBossPlatformDialog({ dismissSoft: true });
       if (dialog && dialog.kind === 'hard_limit') {
         throw createPauseError(formatBossDialogPauseMessage(dialog));
+      }
+      // 平台已经发过招呼语，继续等聊天输入框只会超时并触发重发，直接中断交给上层收尾。
+      if (dialog && dialog.kind === 'greeting_sent') {
+        throw createGreetingSentError(dialog);
       }
 
       if (!/\/chat\b|\/web\/geek\/chat/.test(location.pathname + location.hash) && !document.querySelector('.chat-input')) {
@@ -7761,7 +7914,7 @@
           const result = predicate();
           if (result) finish(null, result);
         } catch (error) {
-          if (error && error.zhipinAutoPause) finish(error);
+          if (error && (error.zhipinAutoPause || error.zhipinGreetingSent)) finish(error);
         }
       };
 
@@ -9686,6 +9839,18 @@
     `;
 
     document.documentElement.appendChild(style);
+  }
+
+  // 测试钩子：仅当浏览器测试页显式设置标记时暴露弹窗处理函数，正常页面不会挂载额外接口。
+  if (pageWindow.__ZHIPIN_AUTO_GREETING_TEST_HOOK__) {
+    pageWindow.__zhipinAutoGreetingTestApi = {
+      findBossPlatformDialog,
+      inspectBossPlatformDialog,
+      getDialogButtonLabel,
+      resetDialogThrottle() {
+        runtime.lastBossDialogDismissAt = 0;
+      },
+    };
   }
 
   installAllowedPageRouteWatcher();
