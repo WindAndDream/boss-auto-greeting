@@ -86,22 +86,24 @@
     const longDialog = api.findBossPlatformDialog();
     assert('长招呼语预览仍能识别', longDialog && longDialog.kind === 'greeting_sent', longDialog && longDialog.kind);
 
-    // 3. 没有“留在本页”时退回关闭按钮；即使“继续沟通”在 DOM 里，也绝不点它。
+    // 3. 没有“留在本页”时退回关闭控件；即使“继续沟通”在 DOM 里，也绝不点它。
     clearStage();
     popup = render(`
       <div class="boss-popup__wrapper" role="dialog">
         <div class="boss-popup__title">已向BOSS发送消息</div>
         <div class="boss-popup__content">HR您好，我对这个岗位比较感兴趣...</div>
         <button type="button" class="btn btn-primary">继续沟通</button>
-        <button type="button" class="boss-popup__close" aria-label="关闭">×</button>
+        <i class="boss-popup__close" aria-label="关闭">×</i>
       </div>
     `);
     clicks = [];
     trackClicks(popup, clicks);
+    const closeIcon = popup.querySelector('.boss-popup__close');
+    closeIcon.addEventListener('click', () => clicks.push('关闭图标'));
     api.resetDialogThrottle();
     const closeFallback = api.inspectBossPlatformDialog({ dismissSoft: true });
     assert(
-      '缺少留在按钮时退回关闭',
+      '缺少留在按钮时退回关闭图标',
       closeFallback && closeFallback.kind === 'greeting_sent' && clicks.length === 1 && !clicks.includes('继续沟通'),
       clicks.join(','),
     );
