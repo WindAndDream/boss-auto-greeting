@@ -29,8 +29,18 @@
 
 - `zhipin-auto-greeting.user.js`：主脚本，负责岗位筛选、自动沟通、记录存储、导出和控制面板。
 - `zhipin-devtools-unlock.user.js`：本地调试辅助脚本，用于降低页面反调试逻辑对 DevTools 的干扰。
+- `tests/dialog-tests.js`：平台弹窗识别的浏览器侧回归测试。
+- `tests/run-dialog-tests.mjs`：测试入口，无依赖，使用本机 Chrome/Edge 运行。
 - `README.md`：面向用户的简要说明。
 - `AGENTS.md`：面向 AI 维护者的项目上下文和约束。
+
+
+
+## 测试
+
+- 运行 `node tests/run-dialog-tests.mjs`，需要本机 Chrome 或 Edge（也可用 `CHROME_PATH` 指定）。
+- 测试页通过 `file://` 加载真实 userscript，覆盖“已向BOSS发送消息”、沟通次数提醒、硬限制和普通内容误判等场景。
+
 
 
 
